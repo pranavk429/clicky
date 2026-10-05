@@ -17,16 +17,20 @@ public actor AXHotCache {
         self.crawler = crawler
     }
     /// Switch the observer to `pid` (call on app activation) and warm the cache.
+    /// A pid change drops the previous app's entries so its targets can never be
+    /// looked up; a dead observer is re-armed even for the same pid.
     public func activate(pid: pid_t) {
         if pid != activePID {
+            entries.removeAll()
+        }
+        if pid != activePID || observer?.isLive != true {
             observer?.stop()
             let bridge = AXStructureObserver(pid: pid) { [weak self] in
                 Task { await self?.structureChanged() }
             }
-            bridge.start()
-            observer = bridge
-            activePID = pid
+            observer = bridge.start() ? bridge : nil
         }
+        activePID = pid          // crawl path must target the new app even when observer creation fails
         scheduleRefresh(afterMilliseconds: 0)
     }
     /// Collapse AXObserver bursts (spec §4.5.3) — 100 ms turns a keystroke storm into one crawl.
@@ -71,7 +75,8 @@ public actor AXHotCache {
     private func refresh() async {
         guard let pid = activePID else { return }
         let fresh = await crawler.snapshot(focusedWindowOf: pid)
-        if !fresh.isEmpty { entries = fresh }   // keep the previous flatten through transient AX failures
+        guard pid == activePID else { return }   // app switched mid-crawl — never publish another app's result
+        if !fresh.isEmpty { entries = fresh }    // keep the previous flatten through transient AX failures
     }
 }
 
@@ -88,36 +93,77 @@ final class AXStructureObserver {
     private let onEvent: () -> Void
     private var observer: AXObserver?
     private var appElement: AXUIElement?
+    private var installedNotifications: [String] = []
 
     init(pid: pid_t, onEvent: @escaping () -> Void) {
         self.pid = pid
         self.onEvent = onEvent
     }
-    deinit { stop() }
+    /// `true` while an observer is registered; a failed `start()` leaves it `false`
+    /// so `AXHotCache` can re-arm on the next activation.
+    var isLive: Bool { observer != nil }
 
-    func start() {
-        guard observer == nil else { return }
+    /// Last-resort teardown only (owner teardown goes through `stop()`): detach
+    /// synchronously when the owner never called `stop()`; safe no-op once detached.
+    deinit { detachLastResort() }
+
+    /// Returns whether the observer is live after the call: `false` only when
+    /// `AXObserverCreate` fails; `true` when already started.
+    @discardableResult
+    func start() -> Bool {
+        guard observer == nil else { return true }
         var created: AXObserver?
-        guard AXObserverCreate(pid, Self.callback, &created) == .success, let created else { return }
+        guard AXObserverCreate(pid, Self.callback, &created) == .success, let created else { return false }
         let app = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        for note in Self.notifications {
-            AXObserverAddNotification(created, app, note as CFString, refcon)
+        installedNotifications = Self.notifications.filter {
+            AXObserverAddNotification(created, app, $0 as CFString, refcon) == .success
         }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .defaultMode)
         observer = created
         appElement = app
+        return true
     }
+    /// Owner-initiated teardown. Callbacks are delivered on the main run loop, so
+    /// the detach runs there too, strongly retaining the bridge until main drains:
+    /// once the source is removed on main no callback can be in flight, which is
+    /// what makes the C callback's `takeUnretainedValue()` safe.
     func stop() {
         guard let observer else { return }
-        if let appElement {
-            for note in Self.notifications {
-                AXObserverRemoveNotification(observer, appElement, note as CFString)
+        let notes = installedNotifications
+        let app = appElement
+        self.observer = nil
+        self.appElement = nil
+        self.installedNotifications = []
+        let teardown = { [self] in
+            if let app {
+                for note in notes {
+                    AXObserverRemoveNotification(observer, app, note as CFString)
+                }
+            }
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        }
+        if Thread.isMainThread {
+            teardown()
+        } else {
+            DispatchQueue.main.async(execute: teardown)
+        }
+    }
+    /// Synchronous last-resort detach for `deinit` when `stop()` was never called;
+    /// a no-op once `stop()` has cleared the stored observer.
+    private func detachLastResort() {
+        guard let observer else { return }
+        let notes = installedNotifications
+        let app = appElement
+        self.observer = nil
+        self.appElement = nil
+        self.installedNotifications = []
+        if let app {
+            for note in notes {
+                AXObserverRemoveNotification(observer, app, note as CFString)
             }
         }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
-        self.observer = nil
-        appElement = nil
     }
     private static let callback: AXObserverCallback = { _, _, _, refcon in
         guard let refcon else { return }

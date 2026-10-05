@@ -33,13 +33,20 @@ final class AXHotCacheTests: XCTestCase {
     func testRevalidatePassesWhenUnchangedAndFailsClosedWhenChanged() async {
         let node = FakeAXNode(AXNodeAttributes(role: "AXButton", title: "Save"))
         let factory = FakeAXNodeFactory()
+        factory.focusedWindowNode = node
         factory.probeNode = node
         let cache = AXHotCache(crawler: AXTreeCrawler(source: factory))
+        await cache.activate(pid: ProcessInfo.processInfo.processIdentifier)
+        await cache.crawlNow()
         let key = CacheKey(role: "AXButton", subrole: "", title: "Save", description: "")
+        let before = await cache.lookup(ElementQuery(text: "save", role: "AXButton"))
+        XCTAssertEqual(before?.snapshot.key.title, "save")
         let stillThere = await cache.revalidate(key: key, against: node.element)
         XCTAssertTrue(stillThere)
         node.attrs.title = "Delete"                        // the UI changed between arm and execute
         let changed = await cache.revalidate(key: key, against: node.element)
         XCTAssertFalse(changed)
+        let stale = await cache.lookup(ElementQuery(text: "save", role: "AXButton"))
+        XCTAssertNil(stale)                                // fail-closed: the stale entry was dropped
     }
 }
