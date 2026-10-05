@@ -28,6 +28,8 @@ public enum AXAppAdapters {
 
     /// UNVERIFIED per app (errata B6): Electron wakes its tree ~50–200 ms after
     /// the attribute is set. Keep this configurable and measure per app.
+    /// Set this once before concurrent wake-probe use (read on every probe);
+    /// it is a process-global tuning knob.
     public static var wakeRetryDelayMilliseconds = 150
 
     /// Ensures `pid` exposes a web AX tree. Returns a restore closure that puts
@@ -35,7 +37,9 @@ public enum AXAppAdapters {
     /// already true (VoiceOver owns it then, so enabling never breaks another
     /// AT). Returns nil for native apps or when nothing could be set. Fallback:
     /// after one retry the caller proceeds regardless; a still-empty tree yields
-    /// an empty crawl, which routes execution to Tier 2/3.
+    /// an empty crawl, which routes execution to Tier 2/3. Performs synchronous
+    /// AX IPC (copy + set, bounded by the 0.25 s global messaging timeout), so
+    /// callers must invoke it from a background executor, never from `@MainActor`.
     @discardableResult
     public static func enableWebTreeIfNeeded(pid: pid_t, family: AXAppFamily) -> (() -> Void)? {
         let attribute: String
@@ -65,7 +69,14 @@ public enum AXAppAdapters {
     public static func waitForTreeWake(pid: pid_t) async -> Bool {
         let crawler = AXTreeCrawler(source: RealAXNodeFactory())
         if await hasWebArea(crawler, pid: pid) { return true }
-        try? await Task.sleep(nanoseconds: UInt64(wakeRetryDelayMilliseconds) * 1_000_000)
+        // `wakeRetryDelayMilliseconds` is a public knob: clamp it so a negative value
+        // cannot trap the sleep conversion. Cancellation fails closed — no second probe
+        // for a caller that no longer wants the answer.
+        do {
+            try await Task.sleep(for: .milliseconds(max(0, wakeRetryDelayMilliseconds)))
+        } catch {
+            return false
+        }
         return await hasWebArea(crawler, pid: pid)
     }
     static func hasWebArea(_ crawler: AXTreeCrawler, pid: pid_t) async -> Bool {
