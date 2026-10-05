@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────
+# Clicky — Swift / SwiftPM / macOS application repository
+# ─────────────────────────────────────────────────────────────
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Swift Package Manager / Xcode build products
+.build/
+build/
+DerivedData/
+.swiftpm/
+*.dSYM
+
+# Packaged application bundles (produced by scripts/make-app.sh)
+*.app
+
+# Secrets & signing material — NEVER commit
+.env
+.env.*
+!.env.example
+*.p12
+*.pem
+*.key
+*.mobileprovision
+Secrets/
+
+# Local logs — note: the research logs under docs/ are intentionally tracked
+*.log
+!docs/research/logs/*.log
+
+# Editors
+.idea/
+*.swp
+*~
+
+# Local scratch
+.tmp/
