@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var notice: String?
     private let state = AppState.shared
+    private var demoRunner: ScriptedDemoRunner?
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.toolTip = "Clicky — voice cursor"
@@ -17,9 +18,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PermissionsCenter.shared.onRevocation = { [weak self] kind in
             Task { @MainActor in self?.setNotice("\(kind.displayName) permission was revoked — open Permissions & First-Run Setup.") }
         }
+        if CommandLine.arguments.contains("--scripted-demo") {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                self?.runScriptedDemo()
+            }
+        }
     }
     @objc private func toggleSession() { state.toggleSession() }
     @objc private func showPermissions() { PermissionsWindowController.shared.show() }
+    @objc private func runScriptedDemo() {
+        let runner = demoRunner ?? ScriptedDemoRunner()
+        demoRunner = runner
+        runner.start()
+    }
+    @objc private func stopScriptedDemo() {
+        if let runner = demoRunner {
+            Task { await runner.stop(reason: .userToggle) }
+        }
+    }
     func setNotice(_ text: String?) { notice = text; rebuildMenu() }
     private func rebuildMenu() {
         guard let item = statusItem else { return }
@@ -42,6 +59,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let permissions = NSMenuItem(title: "Permissions & First-Run Setup…", action: #selector(showPermissions), keyEquivalent: "")
         permissions.target = self
         menu.addItem(permissions)
+        menu.addItem(.separator())
+        let runDemo = NSMenuItem(title: "Run Scripted Demo", action: #selector(runScriptedDemo), keyEquivalent: "")
+        runDemo.target = self
+        menu.addItem(runDemo)
+        let stopDemo = NSMenuItem(title: "Stop Demo (Esc)", action: #selector(stopScriptedDemo), keyEquivalent: "")
+        stopDemo.target = self
+        menu.addItem(stopDemo)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Clicky", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
