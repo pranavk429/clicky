@@ -109,3 +109,105 @@ public struct SystemPasteboard: PasteboardWriting {
         board.clearContents(); board.setString(text, forType: .string)
     }
 }
+
+// MARK: - Outcomes and pacing
+
+public enum TextEntryOutcome: Equatable, Sendable {
+    case directVerified
+    case pasteboardVerified
+    case blocked(rule: SecureInputRule)
+    case unverified(reason: String)
+}
+
+/// Pacing knobs; `.instant` keeps unit tests fast and deterministic.
+public struct SynthesisPacing: Sendable {
+    public var verificationPollCount: Int
+    public var verificationPollInterval: Duration
+    public var dragSteps: Int
+    public var dragStepInterval: Duration
+    public init(verificationPollCount: Int = 3, verificationPollInterval: Duration = .milliseconds(50),
+                dragSteps: Int = 8, dragStepInterval: Duration = .milliseconds(4)) {
+        self.verificationPollCount = verificationPollCount; self.verificationPollInterval = verificationPollInterval
+        self.dragSteps = dragSteps; self.dragStepInterval = dragStepInterval
+    }
+    public static let `default` = SynthesisPacing()
+    public static let instant = SynthesisPacing(verificationPollCount: 1, verificationPollInterval: .zero,
+                                                dragSteps: 2, dragStepInterval: .zero)
+}
+
+// MARK: - EventSynthesizer
+
+/// The single path from intent to synthetic input. Serialized as an actor;
+/// all AX reads and event posts happen off `@MainActor`. Chunks 12–13 drive it;
+/// Chunk 9's kill switch calls `releaseHeldInput()`.
+public actor EventSynthesizer {
+    private let poster: EventPosting
+    private let elements: ElementServices
+    private let secureGuard: SecureInputGuard
+    private let pasteboard: PasteboardWriting
+    private let pacing: SynthesisPacing
+    private static let vKeyCode: CGKeyCode = 9   // ANSI 'v' — pasteboard fallback chord
+
+    public init(poster: EventPosting = SystemEventPoster(),
+                elements: ElementServices = SystemElementServices(),
+                pasteboard: PasteboardWriting = SystemPasteboard(),
+                secureGuard: SecureInputGuard? = nil,
+                pacing: SynthesisPacing = .default) {
+        self.poster = poster; self.elements = elements; self.pasteboard = pasteboard
+        self.secureGuard = secureGuard ?? SecureInputGuard(elements: elements); self.pacing = pacing
+    }
+
+    // MARK: Typing
+
+    /// Enters `text` at keyboard focus using `keyboardSetUnicodeString` events of
+    /// ≤20 UTF-16 units (grapheme-safe via `UnicodeChunker`). Verifies field value,
+    /// falls back to pasteboard + ⌘V (or uses pasteboard directly when `preferPaste`),
+    /// then refuses. Fail-closed: unverifiable entry refuses.
+    public func typeText(_ text: String, into target: AXUIElement? = nil, preferPaste: Bool = false) async -> TextEntryOutcome {
+        guard !text.isEmpty else { return .unverified(reason: "refusing to enter empty text") }
+        let focused = elements.focusedElement()
+        var targets: [AXUIElement] = []
+        if let target { targets.append(target) }
+        if let focused, !targets.contains(where: { CFEqual($0, focused) }) { targets.append(focused) }
+
+        let entryDecision = secureGuard.decision(for: .keystrokes, targets: targets)
+        guard entryDecision.allowed else { return .blocked(rule: entryDecision.ruleFired) }
+        guard let focused else { return .unverified(reason: "no focused element to verify against") }
+
+        let before = elements.stringAttribute(kAXValueAttribute as String, of: focused)
+        if !preferPaste {
+            for chunk in UnicodeChunker.chunk(text) {
+                let recheck = secureGuard.decision(for: .keystrokes, targets: targets)
+                guard recheck.allowed else { return .blocked(rule: recheck.ruleFired) }
+                poster.postUnicode(chunk)
+            }
+            if await fieldShows(text, before: before, in: focused) { return .directVerified }
+        }
+
+        // ⌘V is itself a keystroke injection: re-check before falling back.
+        let pasteDecision = secureGuard.decision(for: .keystrokes, targets: targets)
+        guard pasteDecision.allowed else { return .blocked(rule: pasteDecision.ruleFired) }
+        let priorClipboard = pasteboard.write(text)
+        poster.postKeyChord(keyCode: Self.vKeyCode, flags: .maskCommand)
+        let pasted = await fieldShows(text, before: before, in: focused)
+        if let priorClipboard { pasteboard.restorePlainText(priorClipboard) }
+        return pasted
+            ? .pasteboardVerified
+            : .unverified(reason: "field value did not reflect the text after direct entry and pasteboard fallback")
+    }
+
+    public func type(_ text: String, into target: AXUIElement? = nil) async -> TextEntryOutcome {
+        await typeText(text, into: target, preferPaste: false)
+    }
+
+    private func fieldShows(_ text: String, before: String?, in element: AXUIElement) async -> Bool {
+        for attempt in 0..<max(pacing.verificationPollCount, 1) {
+            if attempt > 0 { try? await Task.sleep(for: pacing.verificationPollInterval) }
+            if let after = elements.stringAttribute(kAXValueAttribute as String, of: element),
+               after.contains(text), after != before {
+                return true
+            }
+        }
+        return false
+    }
+}
