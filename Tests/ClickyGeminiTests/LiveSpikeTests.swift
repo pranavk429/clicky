@@ -43,11 +43,12 @@ final class LiveSpikeTests: XCTestCase {
 
     func testSetupHandshakeAudioStreamEndAndSensitivitySpelling() async throws {
         let client = try makeClient()
+        addTeardownBlock { await client.stop(reason: .userToggle) }
         do {
             try await client.start()
         } catch {
             return XCTFail("""
-                Setup failed within 10 s (\(error)). If the close mentioned an invalid
+                Setup failed within 10 s (\(error.localizedDescription)). If the close mentioned an invalid
                 sensitivity value, apply the rawValue fallback documented in this file's
                 header, then re-run.
                 """)
@@ -62,6 +63,7 @@ final class LiveSpikeTests: XCTestCase {
 
     func testResumptionHandleArrives() async throws {
         let client = try makeClient()
+        addTeardownBlock { await client.stop(reason: .userToggle) }
         try await client.start()
         try await client.sendTextTurn("Say ready.")   // induce generation; updates arrive sooner
         var handle: String?
@@ -77,6 +79,7 @@ final class LiveSpikeTests: XCTestCase {
     func testSchedulingTopLevelPlacementAccepted() async throws {
         let markers = Recorder<GeminiMarker>()
         let client = try makeClient(handler: GatedToolHandler(), markers: markers)
+        addTeardownBlock { await client.stop(reason: .userToggle) }
         try await client.start()
         var observedToolCall = false
         for _ in 0..<3 {
