@@ -158,6 +158,8 @@ You are the chunk reviewer for Chunk N of the Clicky implementation plan.
 
 Each chunk's Acceptance task ends with: dispatch chunk reviewer → fix loop → `chunk N complete: <name>` commit (includes README roadmap update) → tag. The five original logical phases map onto these fifteen chunks: Phase 1 → Chunks 1–2 · Phase 2 → Chunks 3–5 · Phase 3 → Chunks 6–7 · Phase 4 → Chunks 8–11 · Phase 5 → Chunks 12–15. Nothing about the architecture, safety model, or cut order changes — only the review partitioning (each chunk stays under the 1000-line cap).
 
+> **Dated note (2026-10-05, user-approved):** a one-off **Chunk 4.5** insertion (between Chunks 4 and 5, see its section) was added for evaluation round 2. It does not change the fifteen-chunk structure, numbering, tags, or any acceptance gate; it pulls the Chunk 5.2 mock-transport seam and the Chunk 11 controller core forward as a scripted demo slice.
+
 ---
 ## Chunk 1: Foundation A — package graph, coordinates, module seeds (~1 hour)
 
@@ -3075,6 +3077,34 @@ git tag chunk-4-gemini-client-core
 ```
 
 Expected: `git tag --list 'chunk-*'` shows `chunk-4-gemini-client-core`. Do not start Chunk 5 before the chunk reviewer approves.
+
+---
+
+## Chunk 4.5: Evaluation-round-2 scripted ghost-cursor slice — user-approved insertion (2026-10-05)
+
+> **Dated note (2026-10-05, user-approved):** inserted at the user's direction because evaluation round 2 requires a visual demonstration of the shared-control interaction. This emergency insertion pulls two future deliverable *cores* forward — the Chunk 5.2 mock-transport seam and the Chunk 11 ghost-cursor controller — and changes nothing else. Chunk 11 still delivers the full overlay system (pure visual model, placement resolver, per-screen panels, accessible confirmation card, live checks) and must absorb or retire this controller rather than duplicate it. Chunk 5.2 still delivers the full `MockSession`; the app-side scripted transport added here should be replaced by `MockSession` with a real-time sleeper when it lands. No architecture, safety-model, or scope-cut ordering changes. The slice performs **no** AX, `CGEvent`, audio, or network work, and must always be labeled **"scripted server, real pipeline"** in all presentation material (claims discipline, AGENTS.md §4.2).
+
+**Goal:** a menu-bar-triggered scripted demo of the signature interaction: a ghost cursor glides to scripted targets, an intent label (Hindi/Marathi) and the confirmation gate render, the preview never clicks, and a live Esc press performs the local stop — with the real `GeminiLiveClient` processing scripted server frames (setupComplete gating, tool dispatch, cancellation) and the real T3/T4/T6/T8/T12 markers shown in a HUD strip.
+
+**Files (exact):**
+- Create `Sources/ClickyOverlay/GhostCursorController.swift` — demo subset of the Chunk 11 controller: one `.screenSaver`-level borderless, non-activating, click-through `NSPanel` on the main screen (`ignoresMouseEvents = true` set once in `init`); drawn (not asset) ghost cursor; intent label; confirmation bubble; status pill; action flash; stopped banner. Visual language matches Chunk 11 (blue moving pointer, amber label, red pulsing gate, green stopped banner). Easing is a small pure helper.
+- Create `Sources/ClickyApp/ScriptedDemoTransport.swift` — an actor conforming to `GeminiTransport` that streams scripted frames from a timed timeline.
+- Create `Sources/ClickyApp/ScriptedDemoRunner.swift` — owns the real `GeminiLiveClient` plus a `GeminiToolHandling` implementation that drives the overlay; orchestrates the beats; maps `GeminiMarker`s to the HUD; Esc via Carbon `RegisterEventHotKey` (kVK_Escape) → `client.stop(reason: .killSwitch)` → stopped banner; cancels everything cleanly.
+- Modify `Sources/ClickyApp/AppDelegate.swift` — add “Run Scripted Demo” and “Stop Demo (Esc)” menu items; support a `--scripted-demo` launch flag (auto-run ~2 s after launch).
+
+**Beats (scripted server frames; only the server side is fake):**
+1. `{"setupComplete":{}}` after ~0.5 s → client reaches `.ready`; HUD “Ready (scripted server)”.
+2. A `serverContent` audio turn → T4 `firstAudioFrameReceived`.
+3. `toolCall` `demo-fc-1` `preview_action` args `{"target":{"x":0.5,"y":0.42},"label":"Save करो"}` → overlay: intent label + blue pointer glide (~0.8 s) → red confirmation-gate pulse (“Confirm? बोलो: हाँ”) → resolves → action flash “preview only — nothing clicked” → handler returns → real `toolResponse` → T12.
+4. `toolCall` `demo-fc-2` `preview_action` args `{"target":{"x":0.3,"y":0.62},"label":"Type: नमस्ते"}` → same flow (repeatability), spaced so the two previews do not overlap.
+5. Esc at any moment → `client.stop(reason: .killSwitch)` → green “STOPPED — local stop (no network)” banner.
+
+**Acceptance (demo-grade, deliberately lighter than a chunk gate):** `swift build -c release` clean; `swift test` still 46/46; demo reachable via the menu item and via `swift run ClickyApp --scripted-demo`; Esc stops within the same frame and shows the banner; overlay is click-through; zero AX/`CGEvent`/audio/network calls; `grep -rn "TODO\|FIXME" Sources` empty; one uncut backup recording captured; short talk track written. One combined spec+quality review (time-boxed) instead of the two chunk gates; fix loop only for build/behavior defects.
+
+**Fallback ladder (in order, if the clock runs out):** 1) drop the second `toolCall`; 2) instant cursor placement instead of the glide; 3) if the real-client wedge cannot land, drive the overlay from a plain timer — and then the demo must be described as “animation only” (no pipeline claims); 4) fall back to the reel-first option (polished demo-arc video + live walkthrough of the signed app and 46 green tests) and revisit the live slice after the round.
+
+---
+
 ## Chunk 5: Gemini resilience, mock mode & spike (~1.5 hours)
 
 **Deliverable:** session resilience — `ReconnectPolicy` backoff + the `SleepProviding` clock seam, resumable-handle caching, and `goAway`/transport-loss reconnect with fresh-session fallback; local mock mode (`MockSession`) replaying a scripted demo session through the real client and tool dispatch path; and the day-0 live-API spike with explicit pass/fail criteria for the sensitivity spellings, `scheduling` placement, and resumption handles.
@@ -3082,6 +3112,8 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-4-gemini-client-core`. Do not 
 **Definition of done:** `swift build -c release` clean · all unit tests green (the three live-spike tests skip without `GEMINI_API_KEY`) · mock scenario drives the real tool-call path deterministically · resumption caches only `resumable == true` handles · no TODOs · repo buildable.
 
 **Spec sections:** §4.1 (session lifecycle, mock fallback), §4.5; errata A2 (mock mode — never the `gemini-3.1` fallback), A7 (resumable-only handle caching), A9 (`scheduling` placement decided by Spike 5.3); Validation 01 §3.2 (mock replay) and S5 (≤2 s reconnect target). **Est. 1.5 h.**
+
+> **Dated note (2026-10-05, user-approved):** Chunk 4.5 (insertion) adds an app-side scripted `GeminiTransport` plus a demo runner for evaluation round 2. When Task 5.2 lands `MockSession`, prefer replacing that app-side transport with `MockSession` + a real-time sleeper — one scripted-session implementation, not two; the demo's beat text and labels stay unchanged.
 
 ---
 
@@ -8031,6 +8063,8 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-10-audio-engine`. Do not start
 **Definition of done:** `swift build -c release` clean · all tests green (live checks skip without `CLICKY_OVERLAY_LIVE=1`) · Task 11.4 manual OS checks pass (glass wall, full-screen Spaces, multi-display, capture exclusion, VoiceOver card) · no TODOs · repo buildable.
 
 **Spec sections:** §4.3 (window architecture, capture hygiene, speculative motion, states + accessibility), §4.5 execution-leg budget; report 03 §2.4; errata B12 (overlay window recipe CONFIRMED) and B11 (exclude overlays by `CGWindowID`, queried at capture time). **Est. 2 h.** (The first-frame ≤16 ms figure in spec §4.5 stays an architecture target — never asserted as measured.)
+
+> **Dated note (2026-10-05, user-approved):** Chunk 4.5's demo slice adds `Sources/ClickyOverlay/GhostCursorController.swift` — a deliberately minimal, non-CI-tested subset of this chunk's overlay (single-screen panel, drawn cursor, label/gate/flash/stopped states, demo easing). Tasks 11.1–11.3 must absorb or retire it: move the state → visual mapping into the pure model, reuse `OverlayGeometry`, keep the panel recipe (`ignoresMouseEvents` set once in `init`, `.screenSaver` level, non-activating), and delete the demo controller when `OverlayWindowController` supersedes it. No duplicated overlay code may remain at Chunk 11 completion.
 
 ---
 
