@@ -33,6 +33,7 @@ final class PermissionsCenter {
         case .authorized: return .granted
         case .denied: return .denied
         case .notDetermined: return .notDetermined
+        case .restricted: return .denied   // policy-blocked (parental controls/MDM), not grantable
         @unknown default: return .unknown
         }
     }
