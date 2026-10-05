@@ -143,7 +143,7 @@ Implementation runs in fifteen reviewed chunks (each ends with an acceptance tas
 | 4 | **Gemini Live client** | Live client core | ✅ Done |
 | 5 | **Gemini resilience** | Resilience, mock mode & spike | ✅ Done |
 | 6 | **Accessibility engine** | AX crawler, hot cache, app adapters | ✅ Done |
-| 7 | **Input synthesis** | Event synthesis, Unicode-safe keystrokes | ⬜ Planned |
+| 7 | **Input synthesis** | Event synthesis, Unicode-safe keystrokes | ✅ Done |
 | 8 | **Safety gates** | 5-tier risk gate, confirmation gate | ⬜ Planned |
 | 9 | **Audio capture & local stop** | Capture, AEC, local stop path | ⬜ Planned |
 | 10 | **Audio engine** | Session audio engine + barge-in | ⬜ Planned |
