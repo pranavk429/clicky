@@ -88,7 +88,9 @@ public final class AudioStreamEngine: @unchecked Sendable {
         public var tapBufferSize: AVAudioFrameCount = 1024
         public var wireSampleRate: Double = 16_000
         public var wireChunkFrames: Int = 320                  // 20 ms
-        public var outputSampleRate: Double = 48_000           // 24→48 on output
+        // Retained for plan-shape compatibility; the VPIO output anchor now uses the
+        // input format's rate (macOS 27 requires matching client-side formats).
+        public var outputSampleRate: Double = 48_000
         public var vad = LocalVADConfiguration.clickyDefault
         public var aecMuteGate = AECMuteGate()
         public init() {}
@@ -285,8 +287,11 @@ public final class AudioStreamEngine: @unchecked Sendable {
     // MARK: Input (tap thread → processingQueue)
 
     private func handleInput(_ buffer: AVAudioPCMBuffer) {
-        guard let converter, buffer.frameLength > 0,
-              let floatChannel = buffer.floatChannelData?[0] else { return }
+        guard let converter, buffer.frameLength > 0 else { return }
+        guard let floatChannel = buffer.floatChannelData?[0] else {
+            log.error("input buffer has no float channel data (format=\(String(describing: buffer.format), privacy: .public))")
+            return
+        }
         let frames = Int(buffer.frameLength)
         guard let monoSource = AVAudioPCMBuffer(pcmFormat: converter.inputFormat,
                                                 frameCapacity: AVAudioFrameCount(frames)) else { return }
@@ -501,9 +506,13 @@ public final class AudioStreamEngine: @unchecked Sendable {
             // rate, then let startWithRetries() re-enable VP and rebuild with matching
             // formats.
             self.engine.disconnectNodeOutput(self.engine.mainMixerNode)
-            try? self.engine.inputNode.setVoiceProcessingEnabled(false)
+            do { try self.engine.inputNode.setVoiceProcessingEnabled(false) }
+            catch { self.log.notice("could not disable voice processing during reset: \(String(describing: error), privacy: .public)") }
             let plainInputRate = self.engine.inputNode.inputFormat(forBus: 0).sampleRate
-            if plainInputRate > 0 { try? self.connectOutputAnchor(inputSampleRate: plainInputRate) }
+            if plainInputRate > 0 {
+                do { try self.connectOutputAnchor(inputSampleRate: plainInputRate) }
+                catch { self.log.notice("could not re-anchor output during reset: \(String(describing: error), privacy: .public)") }
+            }
             var deviceChange: DeviceChange?
             var restartError: AudioError?
             do {
