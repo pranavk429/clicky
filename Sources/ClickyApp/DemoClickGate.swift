@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import ClickyCore
 import CoreGraphics
 
 /// Wave 2b demo gate: a real, user-confirmed mouse click whose only target is
@@ -88,18 +89,23 @@ final class DemoClickGate: NSObject {
         }
     }
 
-    /// Posts a real left click at `point`; the caller waits, then reads `didFire`.
+    /// Posts a real left click at `point` (AppKit screen coordinates); the caller
+    /// waits, then reads `didFire`. `CGEvent` consumes Quartz (top-left origin)
+    /// coordinates, so the point is flipped through the repo's single conversion
+    /// home before posting.
     @discardableResult
     func performRealClick(at point: CGPoint) -> Bool {
+        guard let primaryHeight = NSScreen.screens.first?.frame.height else { return false }
+        let cgPoint = CoordinateMath.cgPoint(fromAppKit: point, primaryHeight: primaryHeight)
         buttonDidFire = false
         let source = CGEventSource(stateID: .hidSystemState)
         guard let down = CGEvent(mouseEventSource: source,
                                  mouseType: .leftMouseDown,
-                                 mouseCursorPosition: point,
+                                 mouseCursorPosition: cgPoint,
                                  mouseButton: .left),
               let up = CGEvent(mouseEventSource: source,
                                mouseType: .leftMouseUp,
-                               mouseCursorPosition: point,
+                               mouseCursorPosition: cgPoint,
                                mouseButton: .left) else {
             return false
         }

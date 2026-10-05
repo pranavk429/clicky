@@ -78,6 +78,11 @@ final class LiveConversationRunner {
     func start() async {
         guard !running else { return }
 
+        // A quick re-run after a stop must not let the previous session's 4 s
+        // cleanup hide the new session's HUD.
+        cleanupTask?.cancel()
+        cleanupTask = nil
+
         guard let apiKey = ProcessInfo.processInfo.environment["GEMINI_API_KEY"], !apiKey.isEmpty else {
             overlay.showOverlay()
             overlay.setStatus("GEMINI_API_KEY is not set — launch from a shell that sources ~/.clicky-gemini-key")
