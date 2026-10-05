@@ -14,23 +14,30 @@ public enum AmountNormalizer {
         while index < tokens.count {
             if let numeric = decimalToken(tokens[index]) {
                 amounts.append(numeric); index += 1
-            } else if let first = wordValue(tokens[index]) {
-                var compound = 0
-                var current = first
-                var cursor = index + 1
+            } else if wordValue(tokens[index]) != nil || multipliers[tokens[index]] != nil {
+                // Scan one number phrase. A small multiplier (100) scales the
+                // current group; a large multiplier (>= 1000) folds the group
+                // into the running total, so consecutive multipliers compose
+                // ("paanch sau hazaar" → 500_000, not 1_500). An unrecognized
+                // token ends the phrase.
+                var total = 0
+                var group = 0
+                var cursor = index
                 while cursor < tokens.count {
                     if let multiplier = multipliers[tokens[cursor]] {
-                        compound += max(current, 1) * multiplier; current = 0
+                        if multiplier >= 1000 {
+                            total += max(group, 1) * multiplier; group = 0
+                        } else {
+                            group = max(group, 1) * multiplier
+                        }
                     } else if let value = wordValue(tokens[cursor]) {
-                        compound += current; current = value
+                        group += value
                     } else {
                         break
                     }
                     cursor += 1
                 }
-                amounts.append(Decimal(compound + current)); index = cursor
-            } else if let multiplier = multipliers[tokens[index]] {
-                amounts.append(Decimal(multiplier)); index += 1
+                amounts.append(Decimal(total + group)); index = cursor
             } else {
                 index += 1
             }
@@ -72,6 +79,8 @@ public enum AmountNormalizer {
     private static let unitValues: [String: Int] = [
         "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
         "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
         "एक": 1, "दो": 2, "दोन": 2, "तीन": 3, "चार": 4, "पाँच": 5, "पांच": 5, "पाच": 5,
         "सहा": 6, "छह": 6, "छः": 6, "सात": 7, "आठ": 8, "नौ": 9, "नऊ": 9, "दस": 10, "दहा": 10,
         "ek": 1, "do": 2, "teen": 3, "char": 4, "chaar": 4, "paanch": 5, "panch": 5, "paach": 5,
@@ -83,6 +92,8 @@ public enum AmountNormalizer {
         "दोनशे": 200, "तीनशे": 300, "चारशे": 400, "पाचशे": 500, "सहाशे": 600, "सातशे": 700, "आठशे": 800, "नऊशे": 900,
         "bees": 20, "tees": 30, "chalis": 40, "pachas": 50, "pannas": 50,
         "saath": 60, "sattar": 70, "assi": 80, "nabbe": 90,
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+        "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
     ]
     private static let multipliers: [String: Int] = [
         "सौ": 100, "शंभर": 100, "शे": 100, "हज़ार": 1000, "हजार": 1000, "लाख": 100000,
