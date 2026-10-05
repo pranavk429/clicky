@@ -77,6 +77,11 @@ public final class GlobalHotKey: @unchecked Sendable {
                                        EventParamType(typeEventHotKeyID), nil,
                                        MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID)
         guard status == noErr else { return OSStatus(eventNotHandledErr) }
+        // Other Carbon handlers on the application target (e.g. the demo Esc hotkey)
+        // receive the same kEventHotKeyPressed events; match our signature so we never
+        // claim their chords (measured 2026-10-06: shared 'CLKY' + id-only matching let
+        // Esc toggle the session and ⌘⇧Space stop the live demo).
+        guard hotKeyID.signature == GlobalHotKey.signature else { return OSStatus(eventNotHandledErr) }
         let instance = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
         guard let action = Action(rawValue: hotKeyID.id), instance.handles(action) else {
             return OSStatus(eventNotHandledErr)   // another GlobalHotKey instance may handle it
