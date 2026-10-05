@@ -323,6 +323,12 @@ public enum CoordinateMath {
 Run: `swift test --filter ClickyCoreTests 2>&1 | tail -3`
 Expected: `Executed 3 tests, with 0 failures`.
 
+> **Erratum (2026-10-05, recorded during Chunk 1 execution):** SwiftPM validates every target declared in `Package.swift` before compiling any target, so this task's intermediate red/green checkpoints behave as follows when run from scratch:
+> - Step 3's red state is the package-wide source-directory error (`Source files for target ClickyCore should be located under 'Sources/ClickyCore'` — Swift 6.4 wording: "should be located under", not "are expected under").
+> - Step 5 cannot pass as written: after Step 4 the same error class persists for the next unseeded target (`ClickyGemini`). The Core green checkpoint (`Executed 3 tests, with 0 failures`) is first observable after Step 9, once every target has ≥1 source file.
+> - Step 7's expected failure is the analogous error naming `ClickyGemini`, not `error: 'clicky': target 'ClickyApp' referenced in product 'ClickyApp' is empty`.
+> - Step 10, Swift 6.4: `tail -2` of `swift test` ends with the swift-testing footer (`Test run with 0 tests in 0 suites passed`); the XCTest totals appear earlier in the output — 10 tests, 0 failures across the six test bundles.
+
 - [ ] **Step 6: Write the remaining seed tests (failing first)** `[unit test]`
 
 `Tests/ClickyInputTests/UnicodeChunkerTests.swift`
