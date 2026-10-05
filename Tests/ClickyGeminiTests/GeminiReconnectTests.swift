@@ -80,6 +80,8 @@ final class GeminiReconnectTests: XCTestCase {
         let freshSetup = await fresh.waitForSent(count: 1, timeout: 5)
         XCTAssertTrue((freshSetup ?? []).first?.contains("handle") == false,
                       "the fallback session must be fresh (no handle)")
+        let cachedHandle = await client.cachedResumptionHandle
+        XCTAssertNil(cachedHandle, "a fresh session must clear the previous session's handle")
         let fallbackNotice = await notices.wait(matching: { $0.contains("fresh") }, timeout: 5)
         XCTAssertNotNil(fallbackNotice)
         await client.stop(reason: .userToggle)

@@ -207,41 +207,71 @@ public actor GeminiLiveClient {
     private func establish(handle: String?) async throws {
         connectGeneration += 1
         if handle == nil {
-            // Fresh session: old cancellations cannot apply, and the new server
-            // session starts a clean turn with a recreated VAD detector. A resume
-            // (`handle != nil`) keeps both — the server session continues.
+            // Fresh session: old cancellations cannot apply, the new server
+            // session starts a clean turn with a recreated VAD detector, and the
+            // previous session's resumable handle must not be offered again (a
+            // fresh setup deliberately carries no handle). In-flight calls from
+            // the old session fail closed and can never deliver into the new one.
             cancelledToolCallIDs.removeAll()
             sawAudioThisTurn = false
             endOfSpeechDetector = EndOfSpeechDetector(configuration: endOfSpeechDetector.configuration)
+            resumptionHandle = nil
+            dropInFlightToolCalls(reason: "session replaced")
         }
         let generation = connectGeneration
         await transport?.close()
+        transport = nil
+        var ownedTransport: (any GeminiTransport)?
         do {
             let newTransport = try await transportFactory()
+            ownedTransport = newTransport
+            // A stop()/start() that landed while we awaited the factory
+            // supersedes this attempt: die before touching shared state.
+            try requireCurrentGeneration(generation)
             transport = newTransport
             try await newTransport.connect()
+            try requireCurrentGeneration(generation)
             let setup = setupFactory(handle)
             try await newTransport.send(try encode(GeminiClientMessage.setup(setup)))
             // A stop may have landed between the send and this point (actor
             // interleaving) — fail the handshake promptly instead of waiting
             // for the setup timeout.
             if case .stopped = state { throw GeminiClientError.transportUnavailable }
+            try requireCurrentGeneration(generation)
             receiveTask?.cancel()
             receiveTask = Task { await self.receiveLoop(generation: generation) }
-            try await awaitSetupComplete()
+            try await awaitSetupComplete(generation: generation)
         } catch {
-            receiveTask?.cancel()
-            receiveTask = nil
-            setupTimeoutTask?.cancel()
-            setupTimeoutTask = nil
-            await transport?.close()
-            transport = nil
+            // Only the current generation may clear shared handshake state; a
+            // superseder owns the slot and has already closed anything installed.
+            if generation == connectGeneration {
+                receiveTask?.cancel()
+                receiveTask = nil
+                setupTimeoutTask?.cancel()
+                setupTimeoutTask = nil
+                transport = nil
+            }
+            // Close only the transport this attempt created. When superseded, a
+            // successor has already closed a transport it found installed; an
+            // extra close of our own object is harmless. Anything this attempt
+            // never installed cannot leak.
+            if let ownedTransport { await ownedTransport.close() }
             throw error
         }
     }
 
-    private func awaitSetupComplete() async throws {
-        let generation = connectGeneration
+    /// A handshake may only act while it is the newest attempt: a superseding
+    /// stop()/start() or the owning task's cancellation must abort it.
+    private func requireCurrentGeneration(_ generation: Int) throws {
+        guard generation == connectGeneration, !Task.isCancelled else {
+            throw GeminiClientError.transportUnavailable
+        }
+    }
+
+    private func awaitSetupComplete(generation: Int) async throws {
+        // Never clobber a newer attempt's handshake: only the current
+        // generation may park a continuation here.
+        guard generation == connectGeneration else { throw GeminiClientError.transportUnavailable }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             readyContinuation = continuation
             let timeout = setupTimeout

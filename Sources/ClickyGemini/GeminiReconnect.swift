@@ -17,7 +17,7 @@ public struct ReconnectPolicy: Sendable {
     }
 
     public static func goAwayDelay(timeLeftSeconds: Double?) -> TimeInterval {
-        guard let timeLeftSeconds else { return 0 }
+        guard let timeLeftSeconds, timeLeftSeconds.isFinite else { return 0 }
         return max(0, timeLeftSeconds - goAwayMarginSeconds)
     }
 }
@@ -29,7 +29,10 @@ public protocol SleepProviding: Sendable {
 public struct RealSleeper: SleepProviding {
     public init() {}
     public func sleep(seconds: TimeInterval) async throws {
-        try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+        // Server-supplied durations are untrusted: never trap in the UInt64
+        // conversion on a non-finite or astronomical value (cap at one day).
+        let bounded = seconds.isFinite ? min(max(0, seconds), 86_400) : 0
+        try await Task.sleep(nanoseconds: UInt64(bounded * 1_000_000_000))
     }
 }
 
