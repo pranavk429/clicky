@@ -25,6 +25,7 @@ final class LiveConversationRunner {
     private var audioContinuation: AsyncStream<[Int16]>.Continuation?
     private var cleanupTask: Task<Void, Never>?
     private var running = false
+    private var lastAudioStreamEndAt: ContinuousClock.Instant?
 
     /// Menu insurance; barge-in disabled by design in this mode — Esc still stops.
     var halfDuplex = false
@@ -210,13 +211,28 @@ final class LiveConversationRunner {
 
     private func handleMarker(_ marker: GeminiMarker) {
         switch marker {
+        case .audioStreamEndSent:
+            lastAudioStreamEndAt = .now
+        case .firstAudioFrameReceived:
+            if let start = lastAudioStreamEndAt {
+                let components = start.duration(to: .now).components
+                let seconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+                overlay.setStatus(Self.latencyChip(seconds: seconds))
+            }
+            lastAudioStreamEndAt = nil
         case .interruptedReceived:
             player?.stopAll()
         case .toolCallDropped:
             overlay.setStatus("Action dropped — nothing ran")
-        case .audioStreamEndSent, .firstAudioFrameReceived, .toolCallReceived, .toolResponseSent:
+        case .toolCallReceived, .toolResponseSent:
             break
         }
+    }
+
+    /// Measured T3 → T4 for the last voice turn — one leg only, labeled for what it
+    /// is (claims discipline: no end-to-end claim until Chunk 14's meter).
+    static func latencyChip(seconds: Double) -> String {
+        String(format: "last reply started in %.2f s — voice-turn leg only; full meter ships in Chunk 14 (not an end-to-end claim)", seconds)
     }
 }
 
