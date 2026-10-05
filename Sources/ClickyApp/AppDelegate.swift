@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notice: String?
     private let state = AppState.shared
     private var demoRunner: ScriptedDemoRunner?
+    private var liveRunner: LiveConversationRunner?
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.toolTip = "Clicky — voice cursor"
@@ -24,6 +25,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.runScriptedDemo()
             }
         }
+        if CommandLine.arguments.contains("--live-demo") {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                self?.runLiveDemo()
+            }
+        }
     }
     @objc private func toggleSession() { state.toggleSession() }
     @objc private func showPermissions() { PermissionsWindowController.shared.show() }
@@ -36,6 +43,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let runner = demoRunner {
             Task { await runner.stop(reason: .userToggle) }
         }
+    }
+    @objc private func runLiveDemo() {
+        let runner = liveRunner ?? LiveConversationRunner()
+        liveRunner = runner
+        Task { await runner.start() }
+    }
+    @objc private func stopLiveDemo() {
+        if let runner = liveRunner {
+            Task { await runner.stop(reason: .userToggle) }
+        }
+    }
+    @objc private func toggleHalfDuplex() {
+        let runner = liveRunner ?? LiveConversationRunner()
+        liveRunner = runner
+        runner.halfDuplex.toggle()
+        rebuildMenu()
     }
     func setNotice(_ text: String?) { notice = text; rebuildMenu() }
     private func rebuildMenu() {
@@ -66,6 +89,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stopDemo = NSMenuItem(title: "Stop Demo (Esc)", action: #selector(stopScriptedDemo), keyEquivalent: "")
         stopDemo.target = self
         menu.addItem(stopDemo)
+        let runLive = NSMenuItem(title: "Start Live Conversation (English)", action: #selector(runLiveDemo), keyEquivalent: "")
+        runLive.target = self
+        menu.addItem(runLive)
+        let stopLive = NSMenuItem(title: "Stop Live Demo (Esc)", action: #selector(stopLiveDemo), keyEquivalent: "")
+        stopLive.target = self
+        menu.addItem(stopLive)
+        let halfDuplex = NSMenuItem(title: "Half-duplex (mute mic while speaking): \(liveRunner?.halfDuplex == true ? "On" : "Off")",
+                                    action: #selector(toggleHalfDuplex), keyEquivalent: "")
+        halfDuplex.target = self
+        menu.addItem(halfDuplex)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Clicky", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
