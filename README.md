@@ -19,7 +19,7 @@ Speak naturally in English, Hindi, or Marathi — Clicky shows you what it will 
 
 ---
 
-> **Project status (2026-10-05): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is starting now, in reviewed chunks. Nothing has been measured on-device yet — every performance number in this README is an **architecture target** and will be replaced with on-screen meter readings as the build lands.
+> **Project status (2026-10-05): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunk 1 (the package graph and tested foundation math) has landed; `swift build` and `swift test` are green. Nothing has been measured on-device yet — every performance number in this README is an **architecture target** and will be replaced with on-screen meter readings as the build lands.
 
 ## The problem
 
@@ -121,27 +121,37 @@ clicky/
 │   │   ├── validation/       #   independent adversarial validation passes + spec errata
 │   │   └── logs/, prompts/   #   how the research was run (reproducibility)
 │   └── prompts/              # Prompts that drive the next planning/implementation agents
-├── Package.swift             # SwiftPM package (planned — Chunk 1)
-├── Resources/Info.plist      # LSUIElement bundle config (planned — Chunk 1)
-├── scripts/                  # sign-dev / make-app / doctor / run (planned — Chunk 1)
+├── Package.swift             # SwiftPM graph — 9 module targets + 6 test targets
+├── Resources/Info.plist      # LSUIElement bundle config (planned — Chunk 2)
+├── scripts/                  # sign-dev / make-app / doctor / run (planned — Chunk 2)
 ├── Sources/                  # ClickyCore · ClickyGemini · ClickyAccessibility · ClickyInput
 │                             # ClickySafety · ClickyAudio · ClickyVision · ClickyOverlay · ClickyApp
 └── Tests/                    # one test target per logic module
 ```
 
-The full module graph and file-level layout are specified in [spec §5](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md). Today, only `docs/` exists — the rest lands chunk by chunk.
+The full module graph and file-level layout are specified in [spec §5](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md). `Package.swift`, `Sources/`, and `Tests/` (the Chunk 1 foundation) exist today; the resources, scripts, and menu-bar shell land in later chunks.
 
 ## Roadmap
 
-Implementation runs in five reviewed chunks (each ends with an acceptance task, a full-chunk review, and a tagged commit):
+Implementation runs in fifteen reviewed chunks (each ends with an acceptance task, a full-chunk review, and a tagged commit):
 
 | # | Chunk | Contents | Status |
 | :-: | :--- | :--- | :--- |
-| 1 | **Foundation** | SwiftPM graph, unit-tested coordinate math, menu-bar app, permission wizard, signing + bundle scripts | ⬜ Planned |
-| 2 | **Gemini Live client** | Correct wire protocol, hybrid VAD, session resumption & reconnect, local mock mode | ⬜ Planned |
-| 3 | **Accessibility engine + input** | AX crawler & hot cache, app adapters (Electron/Chromium), element matcher, CGEvent synthesis | ⬜ Planned |
-| 4 | **Safety, audio, overlay** | 5-tier risk gate, confirmation gate, kill switch, audio pipeline with AEC, Ghost Cursor | ⬜ Planned |
-| 5 | **Integration & demo** | Tool router + system instruction, latency meter, cost model, demo hardening | ⬜ Planned |
+| 1 | **Foundation A** | Package graph, coordinates, module seeds | ✅ Done |
+| 2 | **Foundation B** | Menu-bar shell, permissions, bundle & signing | ⬜ Planned |
+| 3 | **Gemini wire protocol** | Wire protocol & transport | ⬜ Planned |
+| 4 | **Gemini Live client** | Live client core | ⬜ Planned |
+| 5 | **Gemini resilience** | Resilience, mock mode & spike | ⬜ Planned |
+| 6 | **Accessibility engine** | AX crawler, hot cache, app adapters | ⬜ Planned |
+| 7 | **Input synthesis** | Event synthesis, Unicode-safe keystrokes | ⬜ Planned |
+| 8 | **Safety gates** | 5-tier risk gate, confirmation gate | ⬜ Planned |
+| 9 | **Audio capture & local stop** | Capture, AEC, local stop path | ⬜ Planned |
+| 10 | **Audio engine** | Session audio engine + barge-in | ⬜ Planned |
+| 11 | **Ghost Cursor overlay** | Per-screen panels + Ghost Cursor | ⬜ Planned |
+| 12 | **Tool router & system instruction** | Tool routing + system prompt | ⬜ Planned |
+| 13 | **End-to-end wiring** | Session wiring across modules | ⬜ Planned |
+| 14 | **Latency meter & cost model** | T0–T12 meter + cost model | ⬜ Planned |
+| 15 | **Demo hardening & stretch** | Demo insurance + stretch items | ⬜ Planned |
 
 **Never cut** (per spec §8): Ghost Cursor overlay, voice-triggered AX click, spoken confirmation gate, local stop path.
 
@@ -156,15 +166,16 @@ Implementation runs in five reviewed chunks (each ends with an acceptance task, 
 
 ### Building
 
-Not yet runnable. When Chunk 1 lands, the path will be:
+The package graph builds and its seed tests run today (Chunk 1):
 
 ```bash
-swift build -c release          # developer loop
-./scripts/make-app.sh           # assemble + sign Clicky.app (the demo path)
-open build/Clicky.app
+swift build                     # build the 9 module targets
+swift test                      # run all tests
 ```
 
-The demo runs as a signed `.app` bundle (macOS kills microphone access for bare `swift run` executables without usage descriptions). `GEMINI_API_KEY` is read from the environment — never committed.
+`swift test` of Chunk 1: 10 seed tests, 0 failures (measured 2026-10-05; release build also clean).
+
+The signed `.app` path — `./scripts/make-app.sh` → `open build/Clicky.app` — lands with Chunk 2. The demo runs as a signed `.app` bundle (macOS kills microphone access for bare `swift run` executables without usage descriptions). `GEMINI_API_KEY` is read from the environment — never committed.
 
 ## Name disclaimer
 
