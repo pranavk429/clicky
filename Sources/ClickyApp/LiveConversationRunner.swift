@@ -3,7 +3,9 @@ import Carbon.HIToolbox
 import ClickyAudio
 import ClickyCore
 import ClickyGemini
+import ClickyInput
 import ClickyOverlay
+import CoreGraphics
 import Foundation
 
 /// The Chunk 5.5 Wave-1 live English conversation slice: microphone → Live API →
@@ -26,7 +28,7 @@ final class LiveConversationRunner {
     /// Menu insurance; barge-in disabled by design in this mode — Esc still stops.
     var halfDuplex = false
 
-    nonisolated static let systemInstruction = "You are Clicky, a live voice copilot inside a menu-bar app on this Mac. English only in this build. Speak like a quick, warm conversation partner: one or two short spoken sentences per reply, never a monologue. Actions available in this build: switch_app (open or switch to an app). Use a tool when the user asks for an action, and report the real outcome — the local computer confirms what happened, so never claim an action unless its tool result came back. If you cannot do something (other languages, screen reading, payments, files), say plainly that this build cannot do it yet. The user may interrupt you at any moment; that is expected — stop and listen."
+    nonisolated static let systemInstruction = "You are Clicky, a live voice copilot inside a menu-bar app on this Mac. English only in this build. Speak like a quick, warm conversation partner: one or two short spoken sentences per reply, never a monologue. Actions available in this build: switch_app (open or switch to an app), type_text (type text into the frontmost app after activating it). Use a tool when the user asks for an action, and report the real outcome — the local computer confirms what happened, so never claim an action unless its tool result came back. If you cannot do something (other languages, screen reading, payments, files), say plainly that this build cannot do it yet. The user may interrupt you at any moment; that is expected — stop and listen."
 
     nonisolated static let tools: [GeminiTool] = [
         GeminiTool(functionDeclarations: [
@@ -42,6 +44,23 @@ final class LiveConversationRunner {
                         ])
                     ]),
                     "required": .array([.string("app")])
+                ])),
+            GeminiFunctionDeclaration(
+                name: "type_text",
+                description: "Type text into the frontmost app using synthetic keystrokes. Refused while secure input is on.",
+                parameters: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "text": .object([
+                            "type": .string("string"),
+                            "description": .string("The exact text to type")
+                        ]),
+                        "app": .object([
+                            "type": .string("string"),
+                            "description": .string("Optional app to activate first")
+                        ])
+                    ]),
+                    "required": .array([.string("text")])
                 ]))
         ])
     ]
@@ -198,6 +217,8 @@ private struct LiveToolHandler: GeminiToolHandling {
         switch call.name {
         case "switch_app":
             return await switchApp(call)
+        case "type_text":
+            return await Self.typeText(call, overlay: overlay)
         default:
             return GeminiToolHandlerResult(
                 payload: .object(["status": .string("error"),
@@ -225,6 +246,46 @@ private struct LiveToolHandler: GeminiToolHandling {
             payload: .object(["status": .string("error"),
                               "detail": .string("no standard app named \(name)")]),
             scheduling: .interrupted)
+    }
+
+    private static func typeText(_ call: GeminiToolCall.FunctionCall,
+                                 overlay: GhostCursorController) async -> GeminiToolHandlerResult {
+        guard case .string(let text)? = call.args?["text"], !text.isEmpty else { return error(detail: "missing text") }
+        if case .string(let app)? = call.args?["app"], !app.isEmpty {
+            let activated = await AppActivator.resolveAndActivate(name: app)
+            guard activated != nil else { return error(detail: "no standard app named \(app)") }
+        }
+        guard !IsSecureEventInputEnabled() else {
+            await overlay.setIntent("Refused — secure input is on")
+            return GeminiToolHandlerResult(payload: .object(["status": .string("refused"),
+                                                              "detail": .string("secure input is enabled")]),
+                                           scheduling: .interrupted)
+        }
+        await overlay.setIntent("Typing \(text.count) characters")
+        let source = CGEventSource(stateID: .hidSystemState)
+        for chunk in UnicodeChunker.chunk(text) {           // ≤20 UTF-16 units, grapheme-safe
+            guard !IsSecureEventInputEnabled() else {
+                await overlay.setIntent(nil)
+                return error(detail: "secure input turned on mid-typing — stopped")
+            }
+            let units = Array(chunk.utf16)
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { continue }
+            down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            try? await Task.sleep(for: .milliseconds(12))
+        }
+        await overlay.setIntent(nil)
+        await overlay.flashAction("Typed \(text.count) characters")
+        return GeminiToolHandlerResult(payload: .object(["status": .string("typed")]), scheduling: .whenIdle)
+    }
+
+    /// Shared error result for the tool handlers in this file.
+    private static func error(detail: String) -> GeminiToolHandlerResult {
+        GeminiToolHandlerResult(payload: .object(["status": .string("error"),
+                                                  "detail": .string(detail)]),
+                                scheduling: .interrupted)
     }
 }
 
