@@ -19,7 +19,7 @@ Speak naturally in English, Hindi, or Marathi — Clicky shows you what it will 
 
 ---
 
-> **Project status (2026-10-05): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunks 1–5 (package graph + tested foundation math; the menu-bar shell with the permission wizard and signed `.app` bundle; the Gemini wire-protocol layer with byte-exact offline fixtures and the transport seam; the Gemini Live client core with `setupComplete` gating, non-blocking tool dispatch, fail-closed cancellation, and hybrid-VAD end-of-speech; and Gemini resilience — resumable session caching, `goAway`/transport-loss reconnect with backoff and fresh-session fallback, local mock mode replaying the demo scenario through the real dispatch path, and the day-0 live API spike) have landed; `swift build`, `swift test`, and `./scripts/doctor.sh` are green. Nothing has been measured on-device yet — every performance number in this README is an **architecture target** and will be replaced with on-screen meter readings as the build lands.
+> **Project status (2026-10-06): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunks 1–10 have landed: the package graph + tested foundation math; the menu-bar shell with the permission wizard and signed `.app` bundle; the Gemini wire-protocol layer with byte-exact offline fixtures and the transport seam; the Gemini Live client core with `setupComplete` gating, non-blocking tool dispatch, fail-closed cancellation, and hybrid-VAD end-of-speech; Gemini resilience — resumable session caching, `goAway`/transport-loss reconnect with backoff and fresh-session fallback, local mock mode replaying the demo scenario through the real dispatch path, and the day-0 live API spike; the Accessibility engine (budgeted crawler, hot cache, app adapters); input synthesis (Unicode-safe keystrokes, panic release); the 5-tier safety gates; audio capture + the energy-onset local stop; and the VoiceProcessingIO audio engine with 20 ms PCM chunks, adaptive jitter buffer, `⌘⇧X` kill switch and the in-app audio self-test. `swift build`, `swift test`, and `./scripts/doctor.sh` are green. First on-device measurements (2026-10-06, macOS 27.0.1, signed `.app`): the local stop fired **45.9–84.7 ms from the VAD onset** across runs (target <150 ms), and VPIO delivers 100 ms tap buffers on this OS. Every other performance number in this README remains an **architecture target** until the on-screen meter lands (Chunk 14).
 
 ## The problem
 
@@ -129,7 +129,7 @@ clicky/
 └── Tests/                    # one test target per logic module
 ```
 
-The full module graph and file-level layout are specified in [spec §5](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md). `Package.swift`, `Sources/`, and `Tests/` (the Chunk 1 foundation) plus `Resources/`, `scripts/`, and the menu-bar shell (Chunk 2) exist today; voice, accessibility, safety, and overlay modules land in later chunks.
+The full module graph and file-level layout are specified in [spec §5](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md). `Package.swift`, `Sources/`, `Tests/` (the Chunk 1 foundation), `Resources/`, `scripts/`, the menu-bar shell (Chunk 2), and the voice, accessibility, safety, input-synthesis and audio modules (Chunks 3–10) exist today; the Ghost Cursor overlay, tool router, end-to-end session wiring, latency meter and demo hardening land in later chunks.
 
 ## Roadmap
 
@@ -146,7 +146,7 @@ Implementation runs in fifteen reviewed chunks (each ends with an acceptance tas
 | 7 | **Input synthesis** | Event synthesis, Unicode-safe keystrokes | ✅ Done |
 | 8 | **Safety gates** | 5-tier risk gate, confirmation gate | ✅ Done |
 | 9 | **Audio capture & local stop** | Capture, AEC, local stop path | ✅ Done |
-| 10 | **Audio engine** | Session audio engine + barge-in | ⬜ Planned |
+| 10 | **Audio engine** | Session audio engine + barge-in | ✅ Done |
 | 11 | **Ghost Cursor overlay** | Per-screen panels + Ghost Cursor | ⬜ Planned |
 | 12 | **Tool router & system instruction** | Tool routing + system prompt | ⬜ Planned |
 | 13 | **End-to-end wiring** | Session wiring across modules | ⬜ Planned |
@@ -173,9 +173,17 @@ swift build                     # build the 9 module targets
 swift test                      # run all tests
 ```
 
-`swift test` of Chunk 5: 57 tests, 0 failures, 3 live-spike tests skipped without a key — measured 2026-10-05; release build clean with 0 warnings from a clean scratch build; the keyed live spike passed 3/3 on 2026-10-05.
+`swift test` of Chunk 10 (2026-10-06): **152 tests executed — 144 passed, 8 skipped (gated integration/live tests), 0 failures**; release build clean from a clean scratch build. Earlier milestones: `swift test` of Chunk 5 measured 57 tests, 0 failures, 3 live-spike tests skipped without a key (2026-10-05).
 
 The signed `.app` path is `./scripts/make-app.sh` → `open build/Clicky.app` (`./scripts/run.sh` wraps both). The demo runs as a signed `.app` bundle (macOS kills microphone access for bare `swift run` executables without usage descriptions). `./scripts/doctor.sh` is the demo pre-flight. `GEMINI_API_KEY` is read from the environment — never committed.
+
+### Demo today
+
+Three working paths exist at Chunk 10:
+
+1. **Audio self-test (no key, no network)** — `./scripts/make-app.sh && open build/Clicky.app`, then menu → **"Run Audio Self-Test (30 s)…"**. Plays a 440 Hz tone through the real VoiceProcessingIO graph while the on-device VAD watches the mic; say **"stop"** (any speech works — the local stop is energy-onset based and language-independent) to halt playback with a logged T1→T7 measurement; **⌘⇧X** fires the kill switch (banner + `local stop fired from hotKey`).
+2. **Scripted demo (no key)** — menu → **"Run Scripted Demo"** or `swift run ClickyApp --scripted-demo`: the offline scenario through the real dispatch path.
+3. **Live English slice (needs `GEMINI_API_KEY` + mic/Accessibility)** — see the [live-slice run sheet](docs/demo/live-slice-run-sheet.md).
 
 ## Name disclaimer
 
