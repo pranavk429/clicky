@@ -2149,6 +2149,8 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-3-gemini-protocol`. Do not sta
 
 **Spec sections:** §4.1 (tool semantics, hybrid VAD), §4.5 (T3/T4/T6/T8/T12); errata A2 (async function calling → `NON_BLOCKING` dispatch), A7 (cache only `resumable == true` handles), A8 (`toolCallCancellation` handled), A20 (`setupComplete` gating); Validation 01 §3.2 (hybrid VAD). The app-level lifecycle stays in `ClickyCore.SessionStateMachine`; this client reports `GeminiConnectionState` and Chunk 11 maps `ready ⇄ .listening`, `reconnecting ⇄ .reconnecting`, `StopReason` pass-through. No parallel app state machine is created here. **Est. 2 h.**
 
+> **Erratum (2026-10-05, recorded during Chunk 4 execution):** the acceptance counts below assume 3 transport tests and their breakdowns omit the 1 pacing test; the Chunk 3 erratum corrected transport to 4 (see the Chunk 3 header). Measured chunk-3 acceptance: Gemini **17** tests (1 pacing + 12 protocol + 4 transport), full **30** tests (13 foundation + 17 Gemini — the "14 foundation" figure in earlier texts is a miscount). The actual expected values here are therefore: Task 4.2 Step 7 → Gemini **33** tests (1 pacing + 12 protocol + 4 transport + 10 client + 6 detector); Task 4.3 Step 1 → full **46** tests (13 foundation + 33 Gemini); Task 4.3 Step 2 → Gemini **33** tests. Task 4.1's `Executed 10 tests` is unaffected. The task text retains the original numbers.
+
 ---
 
 ### Task 4.1: `GeminiLiveClient` actor (gating, receive loop, tool dispatch, cancellation)
