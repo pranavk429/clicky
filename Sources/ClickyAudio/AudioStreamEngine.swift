@@ -265,8 +265,9 @@ public final class AudioStreamEngine: @unchecked Sendable {
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else { throw AudioError.noInputDevice }
         // VPIO's input format is a multi-channel duplex format (5–7 ch on macOS 27).
         // AVAudioConverter silently outputs silence when downmixing it to mono without a
-        // channel layout (measured 2026-10-06); all channels carry the same processed
-        // signal, so tap at the hardware format and convert from a mono channel-0 copy.
+        // channel layout (measured 2026-10-06); the processed signal is carried on
+        // channel 0 (measured 2026-10-06), so tap at the hardware format and convert
+        // from a mono channel-0 copy.
         guard let monoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hardwareFormat.sampleRate,
                                              channels: 1, interleaved: false),
               let wireFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: configuration.wireSampleRate,
@@ -457,7 +458,9 @@ public final class AudioStreamEngine: @unchecked Sendable {
                 destination.update(from: base, count: samples.count)
             }
         }
-        if playbackConverter == nil || playbackConverter?.inputFormat.sampleRate != sampleRate {
+        if playbackConverter == nil
+            || playbackConverter?.inputFormat.sampleRate != sampleRate
+            || playbackConverter?.outputFormat != format {
             playbackConverter = AVAudioConverter(from: sourceFormat, to: format)
         }
         guard let converter = playbackConverter else { return nil }
