@@ -75,4 +75,53 @@ final class PointerSynthesisTests: XCTestCase {
         XCTAssertEqual(poster.mouseEvents.map { $0.type }, [.leftMouseDown, .leftMouseDragged, .leftMouseUp])
         XCTAssertEqual(poster.mouseEvents.last?.point, poster.cursorLocation)
     }
+
+    func testPressKeyRefusesWhileSecureInputBlocks() async {
+        let poster = RecordingEventPoster(), elements = FakeElementServices()
+        let pressed = await makeTestSynthesizer(poster: poster, elements: elements,
+                                                secureInputEnabled: { true })
+            .pressKey("return", on: makeSentinelElement())
+        XCTAssertFalse(pressed)
+        XCTAssertTrue(poster.chords.isEmpty)
+    }
+
+    func testPressKeyRefusesUnknownKeyNames() async {
+        let poster = RecordingEventPoster(), elements = FakeElementServices()
+        let pressed = await makeTestSynthesizer(poster: poster, elements: elements)
+            .pressKey("delete", on: makeSentinelElement())
+        XCTAssertFalse(pressed)
+        XCTAssertTrue(poster.chords.isEmpty)
+    }
+
+    func testClickWithoutResolvablePointRefusesInsteadOfClickingTopLeft() async {
+        let poster = RecordingEventPoster(), elements = FakeElementServices()
+        elements.pressResult = .actionUnsupported
+        elements.elementCenterPoint = nil
+        let outcome = await makeTestSynthesizer(poster: poster, elements: elements)
+            .click(element: makeSentinelElement())
+        XCTAssertEqual(outcome, .noTargetPoint(triggering: .actionUnsupported))
+        XCTAssertTrue(poster.mouseEvents.isEmpty)
+    }
+
+    func testCancelledDragDoesNotDisruptSubsequentDrag() async throws {
+        let poster = RecordingEventPoster()
+        let pacing = SynthesisPacing(verificationPollCount: 1, verificationPollInterval: .zero,
+                                     dragSteps: 2, dragStepInterval: .milliseconds(500))
+        let synthesizer = makeTestSynthesizer(poster: poster, elements: FakeElementServices(), pacing: pacing)
+        let firstDrag = Task { await synthesizer.drag(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 40, y: 0)) }
+        var spins = 0
+        while poster.mouseEvents.count < 2 && spins < 1000 {
+            try await Task.sleep(for: .milliseconds(2)); spins += 1
+        }
+        XCTAssertEqual(poster.mouseEvents.count, 2)
+        let released = await synthesizer.releaseHeldInput()
+        XCTAssertTrue(released)
+        let secondDrag = Task { await synthesizer.drag(from: CGPoint(x: 0, y: 0), to: CGPoint(x: 100, y: 0)) }
+        await firstDrag.value
+        await secondDrag.value
+        XCTAssertEqual(poster.mouseEvents.map { $0.type },
+                       [.leftMouseDown, .leftMouseDragged, .leftMouseUp,
+                        .leftMouseDown, .leftMouseDragged, .leftMouseDragged, .leftMouseUp])
+        XCTAssertEqual(poster.mouseEvents.last?.point, CGPoint(x: 100, y: 0))
+    }
 }

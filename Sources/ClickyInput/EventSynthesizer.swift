@@ -122,6 +122,7 @@ public enum TextEntryOutcome: Equatable, Sendable {
 public enum PressOutcome: Equatable, Sendable {
     case axPressed
     case clickFallback(triggering: AXError)
+    case noTargetPoint(triggering: AXError)
 }
 
 /// Pacing knobs; `.instant` keeps unit tests fast and deterministic.
@@ -154,6 +155,7 @@ public actor EventSynthesizer {
     private static let vKeyCode: CGKeyCode = 9   // ANSI 'v' — pasteboard fallback chord
     private var activeDragUpEvent: CGEventType?
     private var dragCancelled = false
+    private var dragGeneration = 0
 
     public init(poster: EventPosting = SystemEventPoster(),
                 elements: ElementServices = SystemElementServices(),
@@ -227,7 +229,7 @@ public actor EventSynthesizer {
         _ = secureGuard.decision(for: .pointerClick, targets: [element])
         let error = elements.performPress(on: element)
         if error == .success { return .axPressed }
-        let point = fallbackPoint ?? elements.elementCenter(element) ?? .zero
+        guard let point = fallbackPoint ?? elements.elementCenter(element) else { return .noTargetPoint(triggering: error) }
         postClick(at: point)
         return .clickFallback(triggering: error)
     }
@@ -260,9 +262,11 @@ public actor EventSynthesizer {
 
     @discardableResult
     public func pressKey(_ key: String, on element: AXUIElement? = nil) -> Bool {
-        _ = secureGuard.decision(for: .keystrokes, targets: element.map { [$0] } ?? [])
+        let decision = secureGuard.decision(for: .keystrokes, targets: element.map { [$0] } ?? [])
+        guard decision.allowed else { return false }
         let keyCodes: [String: CGKeyCode] = ["return": 36, "enter": 36, "escape": 53, "esc": 53, "tab": 48, "space": 49, "down": 125, "up": 126, "left": 123, "right": 124]
-        poster.postKeyChord(keyCode: keyCodes[key.lowercased()] ?? 36, flags: [])
+        guard let keyCode = keyCodes[key.lowercased()] else { return false }
+        poster.postKeyChord(keyCode: keyCode, flags: [])
         return true
     }
 
@@ -271,20 +275,22 @@ public actor EventSynthesizer {
     /// cancels the remaining steps, so no button state is ever left held.
     public func drag(from start: CGPoint, to end: CGPoint) async {
         _ = secureGuard.decision(for: .pointerDrag)
+        dragGeneration &+= 1
+        let generation = dragGeneration
         dragCancelled = false; activeDragUpEvent = .leftMouseUp
         poster.postMouse(type: .leftMouseDown, at: start)
         let steps = max(pacing.dragSteps, 1)
         for step in 1...steps {
             if step > 1 {
                 try? await Task.sleep(for: pacing.dragStepInterval)
-                if dragCancelled { return }
+                if dragCancelled || generation != dragGeneration { return }
             }
             let progress = CGFloat(step) / CGFloat(steps)
             poster.postMouse(type: .leftMouseDragged,
                              at: CGPoint(x: start.x + (end.x - start.x) * progress,
                                          y: start.y + (end.y - start.y) * progress))
         }
-        guard !dragCancelled else { return }
+        guard !dragCancelled, generation == dragGeneration else { return }
         poster.postMouse(type: .leftMouseUp, at: end); activeDragUpEvent = nil
     }
 
