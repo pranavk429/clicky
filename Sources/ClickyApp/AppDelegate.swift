@@ -13,8 +13,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(forName: .clickySessionStateChanged, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.rebuildMenu() }
         }
+        PermissionsCenter.shared.startWatchdog()
+        PermissionsCenter.shared.onRevocation = { [weak self] kind in
+            Task { @MainActor in self?.setNotice("\(kind.displayName) permission was revoked — open Permissions & First-Run Setup.") }
+        }
     }
     @objc private func toggleSession() { state.toggleSession() }
+    @objc private func showPermissions() { PermissionsWindowController.shared.show() }
     func setNotice(_ text: String?) { notice = text; rebuildMenu() }
     private func rebuildMenu() {
         guard let item = statusItem else { return }
@@ -33,6 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 action: #selector(toggleSession), keyEquivalent: "")
         toggle.target = self
         menu.addItem(toggle)
+        menu.addItem(.separator())
+        let permissions = NSMenuItem(title: "Permissions & First-Run Setup…", action: #selector(showPermissions), keyEquivalent: "")
+        permissions.target = self
+        menu.addItem(permissions)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Clicky", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
