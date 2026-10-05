@@ -16,6 +16,6 @@ cp "$BIN_DIR/ClickyApp" "$APP/Contents/MacOS/Clicky"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 # Fixed identifier + fixed certificate = stable designated requirement = TCC survives rebuilds.
-codesign --force --options runtime --timestamp=none -s "Clicky-Dev" -i com.clicky.mac "$APP"
+codesign --force --options runtime --timestamp=none --entitlements Resources/ClickyDev.entitlements -s "Clicky-Dev" -i com.clicky.mac "$APP"
 codesign --verify --deep --strict "$APP"
 echo "Built and signed: $APP   (launch: open $APP)"

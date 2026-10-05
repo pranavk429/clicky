@@ -14,8 +14,20 @@ xcrun --show-sdk-path >/dev/null 2>&1 && ok "macOS SDK" || bad "macOS SDK missin
 if [ -d build/Clicky.app ]; then
   codesign --verify --deep --strict build/Clicky.app >/dev/null 2>&1 \
     && ok "Clicky.app signature valid" || bad "Clicky.app signature invalid (rerun make-app.sh)"
-  codesign -d --requirements - build/Clicky.app 2>/dev/null | grep -q 'certificate leaf = H' \
-    && ok "designated requirement pins Clicky-Dev leaf (TCC persists)" || bad "requirement does not pin Clicky-Dev leaf"
+  REQUIREMENTS="$(codesign -d --requirements - build/Clicky.app 2>/dev/null || true)"
+  CERT_SHA="$(security find-identity -p codesigning 2>/dev/null | awk '/Clicky-Dev/{print $2; exit}' | tr '[:upper:]' '[:lower:]')"
+  if [ -n "$CERT_SHA" ]; then
+    printf '%s' "$REQUIREMENTS" | tr '[:upper:]' '[:lower:]' | grep -q "certificate leaf = h\"$CERT_SHA\"" \
+      && ok "designated requirement pins the current Clicky-Dev leaf (TCC persists)" \
+      || bad "requirement does not match the current Clicky-Dev leaf (rerun make-app.sh)"
+  else
+    warn "Clicky-Dev identity not found; skipped requirement/leaf cross-check"
+  fi
+  ENTITLEMENTS="$(codesign -d --entitlements - build/Clicky.app 2>/dev/null || true)"
+  { printf '%s' "$ENTITLEMENTS" | grep -q 'com.apple.security.device.audio-input' \
+    && printf '%s' "$ENTITLEMENTS" | grep -q 'com.apple.security.automation.apple-events'; } \
+    && ok "entitlements present (audio-input + apple-events)" \
+    || bad "hardened-runtime entitlements missing (rerun make-app.sh; mic and Apple Events would fail)"
 else
   warn "build/Clicky.app not built yet"
 fi
