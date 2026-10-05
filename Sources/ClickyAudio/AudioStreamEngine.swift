@@ -83,7 +83,9 @@ public enum AudioToneGenerator {
 /// through this same engine so AEC has its echo reference — never bypass VPIO.
 public final class AudioStreamEngine: @unchecked Sendable {
     public struct Configuration: Sendable {
-        public var tapBufferSize: AVAudioFrameCount = 1024     // ~21 ms @ 48 kHz
+        // Requested 1024 frames; macOS delivers its own size — measured 4800-frame
+        // (~100 ms) buffers on macOS 27 during Task 10.3 bring-up (2026-10-06).
+        public var tapBufferSize: AVAudioFrameCount = 1024
         public var wireSampleRate: Double = 16_000
         public var wireChunkFrames: Int = 320                  // 20 ms
         public var outputSampleRate: Double = 48_000           // 24→48 on output
@@ -158,12 +160,20 @@ public final class AudioStreamEngine: @unchecked Sendable {
         guard !alreadyRunning else { return }
         do { try engine.inputNode.setVoiceProcessingEnabled(true) }
         catch { throw AudioError.voiceProcessingUnavailable(String(describing: error)) }
+        try connectOutputAnchor()
         guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: configuration.outputSampleRate,
                                                channels: 1, interleaved: false) else { throw AudioError.converterUnavailable }
         lock.lock(); playbackFormat = outputFormat; lock.unlock()
         if player.engine == nil { engine.attach(player) }
         engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
         try installInputTap()
+        // Register before start(): VPIO configures its aggregate device asynchronously, so the
+        // engine may stop itself once right after start ("iounit configuration changed"). The
+        // observer must already be in place so that sweep-up renegotiate() is never missed.
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
+                                                          queue: nil) { [weak self] _ in self?.renegotiate() }
         engine.prepare()
         do { try engine.start() }
         catch {
@@ -173,10 +183,6 @@ public final class AudioStreamEngine: @unchecked Sendable {
             throw AudioError.engineStartFailed(String(describing: error))
         }
         lock.lock(); running = true; player.play(); lock.unlock()
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
-        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
-                                                          queue: nil) { [weak self] _ in self?.renegotiate() }
     }
 
     public func stop() {
@@ -192,6 +198,16 @@ public final class AudioStreamEngine: @unchecked Sendable {
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         player.stop(); player.reset()
         lock.unlock()
+    }
+
+    /// macOS VPIO (measured 2026-10-06, macOS 27): the output node only comes
+    /// online with an explicit mixer→output connection; without it the output
+    /// format stays 0 Hz and start() fails with -10875. The stereo client format
+    /// is converted to the hardware rate by the output node.
+    private func connectOutputAnchor() throws {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: configuration.outputSampleRate,
+                                         channels: 2) else { throw AudioError.converterUnavailable }
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
     }
 
     /// MUST be called with `lifecycleLock` held (from `start()` or `renegotiate()`); it
@@ -422,6 +438,7 @@ public final class AudioStreamEngine: @unchecked Sendable {
             var deviceChange: DeviceChange?
             var restartError: AudioError?
             do {
+                try self.connectOutputAnchor()
                 try self.installInputTap()
                 try self.engine.start()
                 self.lock.lock(); self.player.play(); self.lock.unlock()
