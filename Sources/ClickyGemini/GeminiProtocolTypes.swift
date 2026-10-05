@@ -123,11 +123,11 @@ public struct GeminiTool: Codable, Equatable, Sendable {
 /// Server VAD stays on; these are the tuned half of the hybrid VAD (spec §4.1):
 /// silenceDurationMs 350–500, prefixPaddingMs 20–40, sensitivity HIGH.
 public struct GeminiAutomaticActivityDetection: Codable, Equatable, Sendable {
-    /// Doc-derived enum spellings — verified in Spike 5.3 (Task 5.3). If the server
-    /// rejects them, replace these two rawValue constants (the single definition
-    /// site), re-run the spike, and record a dated errata note in the plan.
-    public static let startOfSpeechHigh = "START_OF_SPEECH_SENSITIVITY_HIGH"
-    public static let endOfSpeechHigh = "END_OF_SPEECH_SENSITIVITY_HIGH"
+    /// Server-verified enum spellings (Spike 5.3, 2026-10-05): the Live API rejects
+    /// the doc-derived `*_OF_SPEECH_SENSITIVITY_*` spellings (close 1007, invalid
+    /// value) and accepts these. Single definition site.
+    public static let startOfSpeechHigh = "START_SENSITIVITY_HIGH"
+    public static let endOfSpeechHigh = "END_SENSITIVITY_HIGH"
     public static let defaultSilenceDurationMs = 400
     public static let defaultPrefixPaddingMs = 30
 
