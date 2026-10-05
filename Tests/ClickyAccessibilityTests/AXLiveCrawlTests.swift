@@ -30,6 +30,10 @@ final class AXLiveCrawlTests: XCTestCase {
         let app = NSRunningApplication(processIdentifier: pid)
         let family = AXAppFamily.detect(appBundleURL: app?.bundleURL)
         let restore = AXAppAdapters.enableWebTreeIfNeeded(pid: pid, family: family)
+        // Calibrated to the measured Electron wake (~2.1 s, VS Code 1.140.0 /
+        // Antigravity IDE, 2026-10-06); the 150 ms default is the plan constant,
+        // not a measurement. B6: measure per app.
+        AXAppAdapters.wakeRetryDelayMilliseconds = 2_500
         let woke = await AXAppAdapters.waitForTreeWake(pid: pid)
         restore?()
         print("AX adapter: family=\(family) treeWake=\(woke) pid=\(pid)")

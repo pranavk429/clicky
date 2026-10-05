@@ -27,4 +27,18 @@ final class AXAppAdaptersTests: XCTestCase {
         XCTAssertEqual(AXAppAdapters.chromiumAttribute, "AXEnhancedUserInterface")
         XCTAssertEqual(AXAppAdapters.wakeRetryDelayMilliseconds, 150)   // unverified default; configurable
     }
+    func testWakeProbeFindsDeeplyNestedWebArea() {
+        var chain = FakeAXNode(AXNodeAttributes(role: "AXWebArea"))
+        for _ in 0..<7 { chain = FakeAXNode(AXNodeAttributes(role: "AXGroup"), children: [chain]) }
+        let factory = FakeAXNodeFactory()
+        factory.focusedWindowNode = chain
+        XCTAssertTrue(AXAppAdapters.hasWebArea(factory: factory, pid: 42))
+    }
+    func testWakeProbeRespectsItsDepthBudget() {
+        var chain = FakeAXNode(AXNodeAttributes(role: "AXWebArea"))
+        for _ in 0..<12 { chain = FakeAXNode(AXNodeAttributes(role: "AXGroup"), children: [chain]) }
+        let factory = FakeAXNodeFactory()
+        factory.focusedWindowNode = chain
+        XCTAssertFalse(AXAppAdapters.hasWebArea(factory: factory, pid: 42))
+    }
 }

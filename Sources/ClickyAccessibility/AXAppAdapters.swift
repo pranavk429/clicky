@@ -26,10 +26,11 @@ public enum AXAppAdapters {
     public static let electronAttribute = "AXManualAccessibility"
     public static let chromiumAttribute = "AXEnhancedUserInterface"
 
-    /// UNVERIFIED per app (errata B6): Electron wakes its tree ~50–200 ms after
-    /// the attribute is set. Keep this configurable and measure per app.
-    /// Set this once before concurrent wake-probe use (read on every probe);
-    /// it is a process-global tuning knob.
+    /// Measured 2026-10-06 (macOS 27.0.1): Electron trees wake ~2.05–2.15 s after
+    /// the attribute is set — VS Code 1.140.0 → 2065 ms; Antigravity IDE → 2125/2136 ms.
+    /// The 150 ms default is the plan's configurable constant, not a measurement;
+    /// calibrate this knob per app. Set this once before concurrent wake-probe use
+    /// (read on every probe); it is a process-global tuning knob.
     public static var wakeRetryDelayMilliseconds = 150
 
     /// Ensures `pid` exposes a web AX tree. Returns a restore closure that puts
@@ -63,12 +64,13 @@ public enum AXAppAdapters {
             _ = AXUIElementSetAttributeValue(app, attribute as CFString, previous)
         }
     }
-    /// Probes for `AXWebArea` under the app's focused window (budgeted crawl);
-    /// retries once after `wakeRetryDelayMilliseconds` because the web tree is
-    /// built asynchronously after enablement (B6).
+    /// Probes for `AXWebArea` under the app's focused window via a dedicated bounded
+    /// search (the web area may nest deeper than the action crawler's depth budget);
+    /// retries once after `wakeRetryDelayMilliseconds` because the web tree is built
+    /// asynchronously after enablement (B6).
     public static func waitForTreeWake(pid: pid_t) async -> Bool {
-        let crawler = AXTreeCrawler(source: RealAXNodeFactory())
-        if await hasWebArea(crawler, pid: pid) { return true }
+        let factory = RealAXNodeFactory()
+        if hasWebArea(factory: factory, pid: pid) { return true }
         // `wakeRetryDelayMilliseconds` is a public knob: clamp it so a negative value
         // cannot trap the sleep conversion. Cancellation fails closed — no second probe
         // for a caller that no longer wants the answer.
@@ -77,10 +79,29 @@ public enum AXAppAdapters {
         } catch {
             return false
         }
-        return await hasWebArea(crawler, pid: pid)
+        return hasWebArea(factory: factory, pid: pid)
     }
-    static func hasWebArea(_ crawler: AXTreeCrawler, pid: pid_t) async -> Bool {
-        let elements = await crawler.snapshot(focusedWindowOf: pid)
-        return elements.contains { $0.key.role == "axwebarea" }
+    /// Local budgets for the wake probe: the web area nests deeper than the
+    /// action crawler's depth budget on current Chromium builds (measured
+    /// 2026-10-06: `AXWebArea` at depth 7 on VS Code 1.140.0 and Antigravity IDE),
+    /// so the probe searches with its own caps instead of reusing `CrawlerBudget`.
+    static let wakeProbeMaxDepth = 10
+    static let wakeProbeMaxNodes = 2_000
+
+    /// Probes for `AXWebArea` under the app's focused window. Performs synchronous
+    /// AX IPC — call from a background executor, never `@MainActor`.
+    static func hasWebArea(factory: any AXNodeFactory, pid: pid_t) -> Bool {
+        guard let root = factory.focusedWindow(of: pid) else { return false }
+        var visited = 0
+        return containsWebArea(root, depth: 0, visited: &visited)
+    }
+    private static func containsWebArea(_ node: any AXNode, depth: Int, visited: inout Int) -> Bool {
+        guard depth <= wakeProbeMaxDepth, visited < wakeProbeMaxNodes else { return false }
+        visited += 1
+        if node.attributes().role == "AXWebArea" { return true }
+        for child in node.children() {
+            if containsWebArea(child, depth: depth + 1, visited: &visited) { return true }
+        }
+        return false
     }
 }
