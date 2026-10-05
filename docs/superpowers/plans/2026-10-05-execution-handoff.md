@@ -4,8 +4,8 @@
 
 **Status of the plan:** complete and reviewed. All 15 chunks written; each chunk passed a plan-document review with findings fixed (protocol correctness, compile-level code fixes, test counts, cross-chunk APIs reconciled).
 
-## Pre-flight before starting Chunk 1 (known blockers)
-1. **Xcode / XCTest:** this machine is CommandLineTools-only (`xcode-select -p` → `/Library/Developer/CommandLineTools`); `swift test` cannot resolve XCTest. Install full Xcode (or select a toolchain with XCTest) before any `[unit test]` step. Build-only steps are fine either way.
+## Pre-flight before starting Chunk 1
+1. **Xcode / XCTest:** ✅ RESOLVED (2026-10-05). Xcode 27.0 installed at `/Applications/Xcode.app`, selected via `xcode-select`, license accepted, first-launch complete. Verified: `swift --version` → Apple Swift 6.4; XCTest smoke test passes (`swift test` → `Executed 1 test, with 0 failures`). Tests can run.
 2. **Git state:** untracked `CraftVerse_KARTA_Accessibility.pptx` at repo root — commit it or add it to `.gitignore` by user choice (plan Task 1.1 pre-flight).
 3. `caffeinate -i` is running to keep the Mac awake during long agent runs (`killall caffeinate` to stop).
 
