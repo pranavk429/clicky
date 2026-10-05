@@ -108,14 +108,20 @@ public final class AudioStreamEngine: @unchecked Sendable {
     private let player = AVAudioPlayerNode()
     private let processingQueue = DispatchQueue(label: "com.clicky.audio.processing", qos: .userInitiated)
     private let lock = NSLock()
+    /// Serializes engine lifecycle: `start()`, `stop()`, and `renegotiate()`'s queue block.
+    /// Also owns `tapInstalled`. Lock order is always lifecycleLock → lock; no path takes
+    /// `lock` and then `lifecycleLock`.
+    private let lifecycleLock = NSLock()
     private let log = Logger(subsystem: "com.clicky.mac", category: "audio")
-    private var converter: AVAudioConverter?              // tap thread only
+    // Installed/reset only inside `installInputTap()` while the engine is stopped (under
+    // lifecycleLock); thereafter read and written on the tap thread only.
+    private var converter: AVAudioConverter?
     private var playbackConverter: AVAudioConverter?      // processingQueue only
     private var playbackFormat: AVAudioFormat?
-    private var pending16k: [Int16] = []                  // tap thread only
-    private var chunkStart: ContinuousClock.Instant?      // tap thread only
+    private var pending16k: [Int16] = []                  // reset by installInputTap(); then tap thread
+    private var chunkStart: ContinuousClock.Instant?      // reset by installInputTap(); then tap thread
     private var vad: LocalVAD                             // processingQueue only
-    private var tapInstalled = false
+    private var tapInstalled = false                      // lifecycleLock territory
     private var running = false
     private var observer: NSObjectProtocol?
     private var mutedChunks = 0
@@ -139,13 +145,15 @@ public final class AudioStreamEngine: @unchecked Sendable {
     }
     public var jitterTargetMillis: Int { lock.lock(); defer { lock.unlock() }; return jitter.targetMillis }
     public var playbackUnderrunCount: Int { lock.lock(); defer { lock.unlock() }; return jitter.underrunCount }
-    public func mutedChunkCount() -> Int { lock.lock(); defer { lock.unlock() }; return mutedChunks }
+    public var mutedChunkCount: Int { lock.lock(); defer { lock.unlock() }; return mutedChunks }
     deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
 
     /// Ordering is immutable (errata B9/B10): enable voice processing while the engine is
     /// stopped, read the actual formats, then start. Throws instead of silently running
     /// without AEC.
     public func start() throws {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
         lock.lock(); let alreadyRunning = running; lock.unlock()
         guard !alreadyRunning else { return }
         do { try engine.inputNode.setVoiceProcessingEnabled(true) }
@@ -158,23 +166,34 @@ public final class AudioStreamEngine: @unchecked Sendable {
         try installInputTap()
         engine.prepare()
         do { try engine.start() }
-        catch { throw AudioError.engineStartFailed(String(describing: error)) }
-        player.play()
-        lock.lock(); running = true; lock.unlock()
+        catch {
+            // A failed start must not leave the tap installed while `running == false`
+            // (stop() would early-return and never clean it up).
+            if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+            throw AudioError.engineStartFailed(String(describing: error))
+        }
+        lock.lock(); running = true; player.play(); lock.unlock()
         observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
                                                           queue: nil) { [weak self] _ in self?.renegotiate() }
     }
 
     public func stop() {
-        lock.lock(); let wasRunning = running; running = false; lock.unlock()
-        guard wasRunning else { return }
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        lock.lock()
+        let wasRunning = running
+        running = false
+        guard wasRunning else { lock.unlock(); return }
         engine.stop()
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         player.stop(); player.reset()
+        lock.unlock()
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
     }
 
+    /// MUST be called with `lifecycleLock` held (from `start()` or `renegotiate()`); it
+    /// (re)writes `converter`, `pending16k`, and `chunkStart` while the engine is stopped.
     private func installInputTap() throws {
         let input = engine.inputNode
         let hardwareFormat = input.inputFormat(forBus: 0)   // actual rate AFTER enabling VP (errata B9)
@@ -209,7 +228,10 @@ public final class AudioStreamEngine: @unchecked Sendable {
             return buffer
         }
         guard conversionError == nil, status == .haveData || status == .inputRanDry,
-              let channel = converted.int16ChannelData?[0], converted.frameLength > 0 else { return }
+              let channel = converted.int16ChannelData?[0], converted.frameLength > 0 else {
+            log.error("input conversion failed: status=\(String(describing: status), privacy: .public) error=\(String(describing: conversionError), privacy: .public)")
+            return
+        }
         if pending16k.isEmpty {
             chunkStart = ContinuousClock.now - Duration.seconds(Double(buffer.frameLength) / buffer.format.sampleRate)
         }
@@ -258,8 +280,8 @@ public final class AudioStreamEngine: @unchecked Sendable {
         lock.lock()
         playbackSuppressed = false; playbackPrimed = false
         playbackBuffered.removeAll(); playbackPartial.removeAll(keepingCapacity: true)
-        lock.unlock()
         if engine.isRunning, !player.isPlaying { player.play() }
+        lock.unlock()
     }
 
     /// The kill-switch/barge-in panic path. Synchronous — the caller measures T7 from this
@@ -268,11 +290,11 @@ public final class AudioStreamEngine: @unchecked Sendable {
         lock.lock()
         playbackSuppressed = true; playbackPrimed = false; playbackBuffered.removeAll()
         playbackOutstanding = 0; playbackStartedAt = nil
-        lock.unlock()
         if player.engine != nil {
             player.stop(); player.reset()
             if engine.isRunning { player.play() }
         }
+        lock.unlock()
     }
 
     /// Feed decoded 24 kHz PCM (one or more model audio chunks): sliced into 20 ms units,
@@ -324,7 +346,9 @@ public final class AudioStreamEngine: @unchecked Sendable {
         if playbackOutstanding == 0 { playbackStartedAt = ContinuousClock.now }
         playbackOutstanding += 1
         player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            self?.playbackCompleted()
+            // Hop off the player callback thread before touching state, so `player.stop()`
+            // under `lock` can never deadlock against a synchronous completion.
+            self?.processingQueue.async { [weak self] in self?.playbackCompleted() }
         }
     }
 
@@ -364,7 +388,10 @@ public final class AudioStreamEngine: @unchecked Sendable {
             consumed = true; pointer.pointee = .haveData
             return source
         }
-        guard conversionError == nil, status == .haveData || status == .inputRanDry, output.frameLength > 0 else { return nil }
+        guard conversionError == nil, status == .haveData || status == .inputRanDry, output.frameLength > 0 else {
+            log.error("playback conversion failed: status=\(String(describing: status), privacy: .public) error=\(String(describing: conversionError), privacy: .public)")
+            return nil
+        }
         return output
     }
 
@@ -379,6 +406,8 @@ public final class AudioStreamEngine: @unchecked Sendable {
     private func renegotiate() {
         processingQueue.async { [weak self] in
             guard let self else { return }
+            self.lifecycleLock.lock()
+            defer { self.lifecycleLock.unlock() }
             self.lock.lock()
             let wasRunning = self.running
             self.playbackPrimed = false; self.playbackBuffered.removeAll()
@@ -392,12 +421,14 @@ public final class AudioStreamEngine: @unchecked Sendable {
             do {
                 try self.installInputTap()
                 try self.engine.start()
-                self.player.play()
+                self.lock.lock(); self.player.play(); self.lock.unlock()
                 self.onDeviceChange?(DeviceChange(
                     inputSampleRate: self.engine.inputNode.inputFormat(forBus: 0).sampleRate,
                     outputSampleRate: self.engine.outputNode.outputFormat(forBus: 0).sampleRate))
                 self.log.notice("audio engine restarted after device change")
             } catch {
+                // A failed restart must not leave the tap installed while `running == false`.
+                if self.tapInstalled { self.engine.inputNode.removeTap(onBus: 0); self.tapInstalled = false }
                 self.lock.lock(); self.running = false; self.lock.unlock()
                 self.onError?(.engineStartFailed(String(describing: error)))
                 self.log.error("audio engine could not restart after device change: \(String(describing: error), privacy: .public)")
