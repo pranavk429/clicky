@@ -1,10 +1,16 @@
 import AppKit
 import ClickyCore
+import ClickyAudio
+import ClickyInput
+import os
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var notice: String?
     private let state = AppState.shared
+    private var hotKeys: GlobalHotKey?
+    private var killSwitch: KillSwitchManager?
+    private var audioSelfTest: AudioSelfTestRunner?
     private var demoRunner: ScriptedDemoRunner?
     private var liveRunner: LiveConversationRunner?
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -31,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.runLiveDemo()
             }
         }
+        installHotKeys()
     }
     @objc private func toggleSession() { state.toggleSession() }
     @objc private func showPermissions() { PermissionsWindowController.shared.show() }
@@ -79,6 +86,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.target = self
         menu.addItem(toggle)
         menu.addItem(.separator())
+        let selfTest = NSMenuItem(title: "Run Audio Self-Test (30 s)…", action: #selector(runAudioSelfTest), keyEquivalent: "")
+        selfTest.target = self
+        menu.addItem(selfTest)
         let permissions = NSMenuItem(title: "Permissions & First-Run Setup…", action: #selector(showPermissions), keyEquivalent: "")
         permissions.target = self
         menu.addItem(permissions)
@@ -116,6 +126,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .idle, .stopped: return NSImage(systemSymbolName: "waveform", accessibilityDescription: "Clicky idle")
         case .listening: return NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Clicky listening")
         case .reconnecting: return NSImage(systemSymbolName: "wifi.exclamationmark", accessibilityDescription: "Clicky reconnecting")
+        }
+    }
+
+    private func installHotKeys() {
+        let killSwitch = KillSwitchManager(hooks: KillSwitchManager.Hooks(
+            stopPlayback: { [weak self] in self?.audioSelfTest?.stopPlaybackNow() },
+            releaseSyntheticInput: { KillSwitchManager.releaseSyntheticInputNow() },
+            presentBanner: { [weak self] text in Task { @MainActor in self?.setNotice(text) } },
+            stopSession: { [weak self] in Task { @MainActor in self?.setNotice("Session stopped — kill switch") } }))
+        self.killSwitch = killSwitch
+        let killStatus = killSwitch.registerKillHotKey()
+        if killStatus != noErr { setNotice("⌘⇧X could not register (OSStatus \(killStatus))") }
+        let sessionToggle = GlobalHotKey(hotKeys: [.sessionToggle]) { _ in
+            Task { @MainActor in AppState.shared.toggleSession() }
+        }
+        let toggleStatus = sessionToggle.register()
+        if toggleStatus != noErr { setNotice("⌘⇧Space could not register (OSStatus \(toggleStatus))") }
+        hotKeys = sessionToggle
+    }
+
+    @objc private func runAudioSelfTest() {
+        guard let killSwitch else { setNotice("Kill switch is not initialized"); return }
+        if audioSelfTest == nil { audioSelfTest = AudioSelfTestRunner(killSwitch: killSwitch) }
+        audioSelfTest?.start()
+    }
+}
+
+/// Dev/diagnostic harness for the Task 10.2 audio bring-up checks: plays a 440 Hz tone
+/// through the real VPIO graph like model audio (24 kHz PCM), logs VAD onsets + stop
+/// latency, and survives a live device switch.
+fileprivate final class AudioSelfTestRunner: @unchecked Sendable {
+    private let engine = AudioStreamEngine()
+    private let killSwitch: KillSwitchManager
+    private let log = Logger(subsystem: "com.clicky.mac", category: "audio-selftest")
+    private var toneTimer: Timer?
+    private var endTimer: Timer?
+    private var inputChunkCount = 0
+    private var onsetCount = 0
+    init(killSwitch: KillSwitchManager) { self.killSwitch = killSwitch }
+
+    func start() {
+        guard !engine.isRunning else { return }
+        killSwitch.reset()
+        engine.beginPlaybackTurn()
+        engine.onInputChunk = { [weak self] _ in Task { @MainActor in self?.noteInputChunk() } }
+        engine.onVADEvent = { [weak self] event, captureStart in
+            Task { @MainActor in self?.noteVAD(event: event, captureStart: captureStart) }
+        }
+        engine.onDeviceChange = { [weak self] change in
+            Task { @MainActor in
+                self?.log.notice("selftest device change: input \(change.inputSampleRate, privacy: .public) Hz")
+            }
+        }
+        engine.onError = { [weak self] error in
+            Task { @MainActor in self?.log.error("selftest engine error: \(String(describing: error), privacy: .public)") }
+        }
+        do { try engine.start() } catch {
+            log.error("selftest could not start: \(String(describing: error), privacy: .public)")
+            return
+        }
+        log.notice("selftest start — 30 s tone; expect 0 onsets in silence, ≥1 on speech")
+        enqueueToneSecond()
+        toneTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.enqueueToneSecond() }
+        endTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.stop() }
+        }
+    }
+
+    func stopPlaybackNow() { engine.stopPlaybackNow() }
+
+    func stop() {
+        toneTimer?.invalidate(); toneTimer = nil
+        endTimer?.invalidate(); endTimer = nil
+        engine.stop()
+        log.notice("selftest end — inputChunks=\(self.inputChunkCount, privacy: .public) onsets=\(self.onsetCount, privacy: .public)")
+    }
+
+    private func enqueueToneSecond() {
+        engine.enqueuePlaybackPCM(AudioToneGenerator.sinePCM(frequency: 440, durationSeconds: 1.0, sampleRate: 24_000),
+                                  sampleRate: 24_000)
+    }
+
+    private func noteInputChunk() {
+        inputChunkCount += 1
+        if inputChunkCount % 50 == 0 {
+            log.notice("selftest progress — chunks=\(self.inputChunkCount, privacy: .public) onsets=\(self.onsetCount, privacy: .public)")
+        }
+    }
+
+    private func noteVAD(event: LocalVADEvent, captureStart: ContinuousClock.Instant) {
+        switch event {
+        case .speechOnset:
+            onsetCount += 1
+            log.notice("selftest VAD onset #\(self.onsetCount, privacy: .public)")
+            killSwitch.triggerBargeIn(source: .voiceOnset, onset: captureStart)
+        case .speechEnded:
+            log.notice("selftest VAD speech ended")
         }
     }
 }
