@@ -99,9 +99,10 @@ final class AXStructureObserver {
         self.pid = pid
         self.onEvent = onEvent
     }
-    /// `true` while an observer is registered; a failed `start()` leaves it `false`
-    /// so `AXHotCache` can re-arm on the next activation.
-    var isLive: Bool { observer != nil }
+    /// `true` when the observer was created AND at least one structure
+    /// notification armed; a failed registration leaves it `false` so
+    /// `AXHotCache` can re-arm on the next activation.
+    var isLive: Bool { observer != nil && !installedNotifications.isEmpty }
 
     /// Last-resort teardown only (owner teardown goes through `stop()`): detach
     /// synchronously when the owner never called `stop()`; safe no-op once detached.
@@ -125,9 +126,10 @@ final class AXStructureObserver {
         return true
     }
     /// Owner-initiated teardown. Callbacks are delivered on the main run loop, so
-    /// the detach runs there too, strongly retaining the bridge until main drains:
-    /// once the source is removed on main no callback can be in flight, which is
-    /// what makes the C callback's `takeUnretainedValue()` safe.
+    /// the detach runs there too; the block's `[self]` capture keeps the bridge
+    /// (and its live `AXObserver`/run-loop source) retained until main has drained,
+    /// so once the source is removed no callback can be in flight — which is what
+    /// makes the C callback's `takeUnretainedValue()` safe.
     func stop() {
         guard let observer else { return }
         let notes = installedNotifications
@@ -136,18 +138,21 @@ final class AXStructureObserver {
         self.appElement = nil
         self.installedNotifications = []
         let teardown = { [self] in
-            if let app {
-                for note in notes {
-                    AXObserverRemoveNotification(observer, app, note as CFString)
-                }
-            }
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+            self.detach(observer: observer, app: app, notes: notes)
         }
         if Thread.isMainThread {
             teardown()
         } else {
             DispatchQueue.main.async(execute: teardown)
         }
+    }
+    private func detach(observer: AXObserver, app: AXUIElement?, notes: [String]) {
+        if let app {
+            for note in notes {
+                AXObserverRemoveNotification(observer, app, note as CFString)
+            }
+        }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
     }
     /// Synchronous last-resort detach for `deinit` when `stop()` was never called;
     /// a no-op once `stop()` has cleared the stored observer.
@@ -158,12 +163,7 @@ final class AXStructureObserver {
         self.observer = nil
         self.appElement = nil
         self.installedNotifications = []
-        if let app {
-            for note in notes {
-                AXObserverRemoveNotification(observer, app, note as CFString)
-            }
-        }
-        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        detach(observer: observer, app: app, notes: notes)
     }
     private static let callback: AXObserverCallback = { _, _, _, refcon in
         guard let refcon else { return }
