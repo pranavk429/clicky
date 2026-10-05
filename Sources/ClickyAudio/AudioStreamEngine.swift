@@ -114,12 +114,12 @@ public final class AudioStreamEngine: @unchecked Sendable {
     private let lifecycleLock = NSLock()
     private let log = Logger(subsystem: "com.clicky.mac", category: "audio")
     // Installed/reset only inside `installInputTap()` while the engine is stopped (under
-    // lifecycleLock); thereafter read and written on the tap thread only.
-    private var converter: AVAudioConverter?
+    // lifecycleLock); thereafter each field's access is as noted.
+    private var converter: AVAudioConverter?              // written only by installInputTap(); then read on the tap thread
     private var playbackConverter: AVAudioConverter?      // processingQueue only
     private var playbackFormat: AVAudioFormat?
-    private var pending16k: [Int16] = []                  // reset by installInputTap(); then tap thread
-    private var chunkStart: ContinuousClock.Instant?      // reset by installInputTap(); then tap thread
+    private var pending16k: [Int16] = []                  // reset by installInputTap(); then read/written on the tap thread
+    private var chunkStart: ContinuousClock.Instant?      // reset by installInputTap(); then read/written on the tap thread
     private var vad: LocalVAD                             // processingQueue only
     private var tapInstalled = false                      // lifecycleLock territory
     private var running = false
@@ -173,6 +173,8 @@ public final class AudioStreamEngine: @unchecked Sendable {
             throw AudioError.engineStartFailed(String(describing: error))
         }
         lock.lock(); running = true; player.play(); lock.unlock()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
         observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
                                                           queue: nil) { [weak self] _ in self?.renegotiate() }
     }
@@ -180,6 +182,8 @@ public final class AudioStreamEngine: @unchecked Sendable {
     public func stop() {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
         lock.lock()
         let wasRunning = running
         running = false
@@ -188,8 +192,6 @@ public final class AudioStreamEngine: @unchecked Sendable {
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         player.stop(); player.reset()
         lock.unlock()
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
     }
 
     /// MUST be called with `lifecycleLock` held (from `start()` or `renegotiate()`); it
@@ -407,32 +409,39 @@ public final class AudioStreamEngine: @unchecked Sendable {
         processingQueue.async { [weak self] in
             guard let self else { return }
             self.lifecycleLock.lock()
-            defer { self.lifecycleLock.unlock() }
             self.lock.lock()
             let wasRunning = self.running
             self.playbackPrimed = false; self.playbackBuffered.removeAll()
             self.playbackPartial.removeAll(keepingCapacity: true)
             self.playbackOutstanding = 0; self.playbackStartedAt = nil
             self.lock.unlock()
-            guard wasRunning else { return }
+            guard wasRunning else { self.lifecycleLock.unlock(); return }
             self.log.notice("AVAudioEngineConfigurationChange — re-negotiating formats")
             self.engine.stop()
             if self.tapInstalled { self.engine.inputNode.removeTap(onBus: 0); self.tapInstalled = false }
+            var deviceChange: DeviceChange?
+            var restartError: AudioError?
             do {
                 try self.installInputTap()
                 try self.engine.start()
                 self.lock.lock(); self.player.play(); self.lock.unlock()
-                self.onDeviceChange?(DeviceChange(
+                deviceChange = DeviceChange(
                     inputSampleRate: self.engine.inputNode.inputFormat(forBus: 0).sampleRate,
-                    outputSampleRate: self.engine.outputNode.outputFormat(forBus: 0).sampleRate))
+                    outputSampleRate: self.engine.outputNode.outputFormat(forBus: 0).sampleRate)
                 self.log.notice("audio engine restarted after device change")
             } catch {
                 // A failed restart must not leave the tap installed while `running == false`.
                 if self.tapInstalled { self.engine.inputNode.removeTap(onBus: 0); self.tapInstalled = false }
                 self.lock.lock(); self.running = false; self.lock.unlock()
-                self.onError?(.engineStartFailed(String(describing: error)))
-                self.log.error("audio engine could not restart after device change: \(String(describing: error), privacy: .public)")
+                let message = String(describing: error)
+                restartError = .engineStartFailed(message)
+                self.log.error("audio engine could not restart after device change: \(message, privacy: .public)")
             }
+            // Release the lifecycle lock before invoking user callbacks: a handler may
+            // synchronously call start()/stop(), which would deadlock on the non-recursive lock.
+            self.lifecycleLock.unlock()
+            if let deviceChange { self.onDeviceChange?(deviceChange) }
+            if let restartError { self.onError?(restartError) }
         }
     }
 }
