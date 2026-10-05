@@ -70,11 +70,13 @@ public actor GeminiLiveClient {
     private var cancelledToolCallIDs: Set<String> = []
     private var resumptionHandle: String?
     private var sawAudioThisTurn = false
+    private var endOfSpeechDetector: EndOfSpeechDetector
 
     public init(transportFactory: @escaping TransportFactory,
                 setupFactory: @escaping SetupFactory,
                 toolHandler: (any GeminiToolHandling)? = nil,
                 setupTimeout: TimeInterval = 10,
+                vadConfiguration: EndOfSpeechDetector.Configuration = .clickyDefault,
                 onServerContent: (@Sendable (GeminiServerContent) -> Void)? = nil,
                 onNotice: (@Sendable (String) -> Void)? = nil,
                 onMarker: (@Sendable (GeminiMarker) -> Void)? = nil) {
@@ -82,6 +84,7 @@ public actor GeminiLiveClient {
         self.setupFactory = setupFactory
         self.toolHandler = toolHandler
         self.setupTimeout = setupTimeout
+        self.endOfSpeechDetector = EndOfSpeechDetector(configuration: vadConfiguration)
         self.onServerContent = onServerContent
         self.onNotice = onNotice
         self.onMarker = onMarker
@@ -138,6 +141,20 @@ public actor GeminiLiveClient {
     /// (spec §4.1; constants in AudioChunkPacing).
     public func sendAudio(_ pcm: Data) async throws {
         try await transmit(.realtimeAudio(GeminiBlob(bytes: pcm, mimeType: AudioChunkPacing.audioMimeType)))
+    }
+
+    /// Sends one 16-bit LE PCM frame (20 ms @ 16 kHz) and runs the hybrid-VAD
+    /// end-of-speech rule; the `audioStreamEnd` message fires once per burst.
+    /// Call serially from the single audio producer — detector processing must stay ordered.
+    public func sendAudioFrame(_ samples: [Int16]) async throws {
+        var pcm = Data(capacity: samples.count * 2)
+        for sample in samples {
+            withUnsafeBytes(of: sample.littleEndian) { pcm.append(contentsOf: $0) }
+        }
+        try await sendAudio(pcm)
+        if endOfSpeechDetector.process(samples) {
+            try await sendAudioStreamEnd()
+        }
     }
 
     public func sendVideoFrame(jpeg: Data) async throws {

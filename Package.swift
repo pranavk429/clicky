@@ -7,7 +7,7 @@ let package = Package(
     products: [.executable(name: "ClickyApp", targets: ["ClickyApp"])],
     targets: [
         .target(name: "ClickyCore", swiftSettings: v5),
-        .target(name: "ClickyGemini", dependencies: ["ClickyCore"], swiftSettings: v5),
+        .target(name: "ClickyGemini", dependencies: ["ClickyCore", "ClickyAudio"], swiftSettings: v5),
         .target(name: "ClickyAccessibility", dependencies: ["ClickyCore"], swiftSettings: v5),
         .target(name: "ClickyInput", dependencies: ["ClickyCore"], swiftSettings: v5),
         .target(name: "ClickySafety", dependencies: ["ClickyCore"], swiftSettings: v5),
