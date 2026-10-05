@@ -41,3 +41,6 @@ Secrets/
 
 # Local scratch
 .tmp/
+
+# Presentation decks (hackathon material kept local by choice)
+*.pptx
