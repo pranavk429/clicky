@@ -3115,6 +3115,8 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-4-gemini-client-core`. Do not 
 
 > **Dated note (2026-10-05, user-approved):** Chunk 4.5 (insertion) adds an app-side scripted `GeminiTransport` plus a demo runner for evaluation round 2. When Task 5.2 lands `MockSession`, prefer replacing that app-side transport with `MockSession` + a real-time sleeper — one scripted-session implementation, not two; the demo's beat text and labels stay unchanged.
 
+> **Erratum (2026-10-05, recorded before Chunk 5 execution):** the expected counts below predate earlier recorded errata — the measured Gemini baseline is **33** (1 pacing + 12 protocol + 4 transport + 10 client + 6 detector) and the full suite is **46** (13 foundation + 33 Gemini), not 31/45. Actual values: Task 5.1 Step 5 → Gemini **38** (33 + 5 reconnect); Task 5.4 Step 1 → full **57** (46 + 5 reconnect + 3 mock + 3 live spike) — with no key, XCTest reports `57 tests, with 3 tests skipped and 0 failures`; with the key, all 57 run (the spike's documented inconclusive-skip on its third test remains possible on a re-run). Task 5.2's `Executed 3 tests` and Task 5.4 Step 2 are unaffected.
+
 ---
 
 ### Task 5.1: Session resumption + `goAway` reconnect with backoff
