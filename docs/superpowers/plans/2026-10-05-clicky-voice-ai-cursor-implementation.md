@@ -663,9 +663,10 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-1-foundation-a` and the GitHub
 
 **Spec sections:** §4.6 (setup/signing/TCC), §5; errata B14/B15/B16. **Est. 2 h.** (The ⌘⇧Space global hotkey arrives with the Carbon utility in Chunk 9; the menu toggle covers this chunk.)
 
-> **Erratum (2026-10-05, recorded during Chunk 2 execution):** two code blocks below required compile-level corrections on the verified toolchain (Swift 6.4 / macOS 26 SDK); the committed code uses the corrected forms:
+> **Erratum (2026-10-05, recorded during Chunk 2 execution):** three code blocks below required corrections on the verified toolchain (Swift 6.4 / macOS 26 SDK); the committed code uses the corrected forms:
 > - Task 2.1 `AppState.swift`: `import Combine` alone does not bring `Notification`/`NotificationCenter` into scope under Swift 6 — add `import Foundation` as the first line.
 > - Task 2.2 `PermissionsCenter.preflightAutomation`: `AECreateDesc` is imported as returning `OSErr` (`Int16`) while the function returns `OSStatus` (`Int32`) — the early return must read `return OSStatus(created)`.
+> - Task 2.3 `sign-dev.sh` / `doctor.sh`: the openssl-imported identity is intentionally untrusted (`CSSMERR_TP_NOT_TRUSTED`), so existence checks must query `security find-identity -p codesigning` WITHOUT `-v` (with `-v` the B15 never-recreate guard misses the identity; signing and TCC work fine untrusted — verified by sign + `--verify --deep --strict` + leaf-pinned requirement); and the secret scan must match the real key shape `AIza[0-9A-Za-z_-]{35}` rather than the bare string `AIza`, which self-matched the plan/script text and falsely failed `doctor.sh`.
 
 ---
 
