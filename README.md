@@ -19,7 +19,7 @@ Speak naturally in English, Hindi, or Marathi — Clicky shows you what it will 
 
 ---
 
-> **Project status (2026-10-05): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunks 1–3 (package graph + tested foundation math; the menu-bar shell with the permission wizard and signed `.app` bundle; and the Gemini wire-protocol layer with byte-exact offline fixtures and the transport seam) have landed; `swift build`, `swift test`, and `./scripts/doctor.sh` are green. Nothing has been measured on-device yet — every performance number in this README is an **architecture target** and will be replaced with on-screen meter readings as the build lands.
+> **Project status (2026-10-05): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunks 1–4 (package graph + tested foundation math; the menu-bar shell with the permission wizard and signed `.app` bundle; the Gemini wire-protocol layer with byte-exact offline fixtures and the transport seam; and the Gemini Live client core with `setupComplete` gating, non-blocking tool dispatch, fail-closed cancellation, and hybrid-VAD end-of-speech) have landed; `swift build`, `swift test`, and `./scripts/doctor.sh` are green. Nothing has been measured on-device yet — every performance number in this README is an **architecture target** and will be replaced with on-screen meter readings as the build lands.
 
 ## The problem
 
@@ -140,7 +140,7 @@ Implementation runs in fifteen reviewed chunks (each ends with an acceptance tas
 | 1 | **Foundation A** | Package graph, coordinates, module seeds | ✅ Done |
 | 2 | **Foundation B** | Menu-bar shell, permissions, bundle & signing | ✅ Done |
 | 3 | **Gemini wire protocol** | Wire protocol & transport | ✅ Done |
-| 4 | **Gemini Live client** | Live client core | ⬜ Planned |
+| 4 | **Gemini Live client** | Live client core | ✅ Done |
 | 5 | **Gemini resilience** | Resilience, mock mode & spike | ⬜ Planned |
 | 6 | **Accessibility engine** | AX crawler, hot cache, app adapters | ⬜ Planned |
 | 7 | **Input synthesis** | Event synthesis, Unicode-safe keystrokes | ⬜ Planned |
@@ -173,7 +173,7 @@ swift build                     # build the 9 module targets
 swift test                      # run all tests
 ```
 
-`swift test` of Chunk 3: 30 tests, 0 failures (measured 2026-10-05; release build clean with 0 warnings, verified from a clean scratch build).
+`swift test` of Chunk 4: 46 tests, 0 failures (measured 2026-10-05; release build clean with 0 warnings, verified from a clean scratch build).
 
 The signed `.app` path is `./scripts/make-app.sh` → `open build/Clicky.app` (`./scripts/run.sh` wraps both). The demo runs as a signed `.app` bundle (macOS kills microphone access for bare `swift run` executables without usage descriptions). `./scripts/doctor.sh` is the demo pre-flight. `GEMINI_API_KEY` is read from the environment — never committed.
 
