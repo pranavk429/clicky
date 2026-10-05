@@ -119,6 +119,11 @@ public enum TextEntryOutcome: Equatable, Sendable {
     case unverified(reason: String)
 }
 
+public enum PressOutcome: Equatable, Sendable {
+    case axPressed
+    case clickFallback(triggering: AXError)
+}
+
 /// Pacing knobs; `.instant` keeps unit tests fast and deterministic.
 public struct SynthesisPacing: Sendable {
     public var verificationPollCount: Int
@@ -147,6 +152,8 @@ public actor EventSynthesizer {
     private let pasteboard: PasteboardWriting
     private let pacing: SynthesisPacing
     private static let vKeyCode: CGKeyCode = 9   // ANSI 'v' — pasteboard fallback chord
+    private var activeDragUpEvent: CGEventType?
+    private var dragCancelled = false
 
     public init(poster: EventPosting = SystemEventPoster(),
                 elements: ElementServices = SystemElementServices(),
@@ -209,5 +216,93 @@ public actor EventSynthesizer {
             }
         }
         return false
+    }
+
+    // MARK: Pointers, scroll and keys
+
+    /// `AXPressAction` first; on any AX failure, hover + synthetic click at
+    /// `fallbackPoint` (or the element's resolved center).
+    @discardableResult
+    public func click(element: AXUIElement, fallbackPoint: CGPoint? = nil) -> PressOutcome {
+        _ = secureGuard.decision(for: .pointerClick, targets: [element])
+        let error = elements.performPress(on: element)
+        if error == .success { return .axPressed }
+        let point = fallbackPoint ?? elements.elementCenter(element) ?? .zero
+        postClick(at: point)
+        return .clickFallback(triggering: error)
+    }
+
+    @discardableResult
+    public func press(_ element: AXUIElement, fallbackPoint: CGPoint) -> PressOutcome {
+        click(element: element, fallbackPoint: fallbackPoint)
+    }
+
+    @discardableResult
+    public func click(at point: CGPoint) -> SecureInputDecision {
+        let decision = secureGuard.decision(for: .pointerClick)
+        postClick(at: point)
+        return decision
+    }
+
+    public func moveMouse(to point: CGPoint) {
+        _ = secureGuard.decision(for: .pointerMove)
+        poster.postMouse(type: .mouseMoved, at: point)
+    }
+
+    @discardableResult
+    public func scroll(_ direction: String, on element: AXUIElement? = nil) -> Bool {
+        _ = secureGuard.decision(for: .pointerMove)
+        let delta: Int32 = (direction.lowercased() == "up") ? 5 : -5
+        let point = element.flatMap { elements.elementCenter($0) } ?? poster.currentCursorLocation()
+        poster.postScroll(delta: delta, at: point)
+        return true
+    }
+
+    @discardableResult
+    public func pressKey(_ key: String, on element: AXUIElement? = nil) -> Bool {
+        _ = secureGuard.decision(for: .keystrokes, targets: element.map { [$0] } ?? [])
+        let keyCodes: [String: CGKeyCode] = ["return": 36, "enter": 36, "escape": 53, "esc": 53, "tab": 48, "space": 49, "down": 125, "up": 126, "left": 123, "right": 124]
+        poster.postKeyChord(keyCode: keyCodes[key.lowercased()] ?? 36, flags: [])
+        return true
+    }
+
+    /// Left-button drag with interpolated `.leftMouseDragged` events. If the
+    /// kill switch fires mid-drag, `releaseHeldInput()` posts the up-event and
+    /// cancels the remaining steps, so no button state is ever left held.
+    public func drag(from start: CGPoint, to end: CGPoint) async {
+        _ = secureGuard.decision(for: .pointerDrag)
+        dragCancelled = false; activeDragUpEvent = .leftMouseUp
+        poster.postMouse(type: .leftMouseDown, at: start)
+        let steps = max(pacing.dragSteps, 1)
+        for step in 1...steps {
+            if step > 1 {
+                try? await Task.sleep(for: pacing.dragStepInterval)
+                if dragCancelled { return }
+            }
+            let progress = CGFloat(step) / CGFloat(steps)
+            poster.postMouse(type: .leftMouseDragged,
+                             at: CGPoint(x: start.x + (end.x - start.x) * progress,
+                                         y: start.y + (end.y - start.y) * progress))
+        }
+        guard !dragCancelled else { return }
+        poster.postMouse(type: .leftMouseUp, at: end); activeDragUpEvent = nil
+    }
+
+    /// Kill-switch hook (Chunk 9): completes any in-flight drag with a mouse-up
+    /// at the live cursor position. Key chords are posted atomically (down+up),
+    /// so no modifier state is ever held. Returns true when an up-event fired.
+    @discardableResult
+    public func releaseHeldInput() -> Bool {
+        guard let upType = activeDragUpEvent else { return false }
+        dragCancelled = true; activeDragUpEvent = nil
+        let location = poster.currentCursorLocation()
+        poster.postMouse(type: upType, at: location)
+        InputLog.synthesizer.notice("kill switch: released held drag with \(upType.rawValue, privacy: .public) at x=\(location.x, privacy: .public) y=\(location.y, privacy: .public)")
+        return true
+    }
+
+    private func postClick(at point: CGPoint) {
+        poster.postMouse(type: .mouseMoved, at: point)
+        poster.postMouse(type: .leftMouseDown, at: point); poster.postMouse(type: .leftMouseUp, at: point)
     }
 }
