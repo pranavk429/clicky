@@ -45,7 +45,7 @@ public actor PendingActionGate {
     private static func clampTimeout(_ seconds: TimeInterval) -> TimeInterval {
         min(max(seconds, minimumTimeout), maximumTimeout)
     }
-    public init(timeout: TimeInterval = PendingActionGate.defaultTimeout, now: @Sendable @escaping () -> Date = Date.init) {
+    public init(timeout: TimeInterval = PendingActionGate.defaultTimeout, now: @Sendable @escaping () -> Date = { Date() }) {
         self.timeout = Self.clampTimeout(timeout); self.now = now
     }
     public var effectiveTimeout: TimeInterval { timeout }

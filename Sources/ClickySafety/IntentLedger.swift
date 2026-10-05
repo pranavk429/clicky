@@ -28,7 +28,7 @@ public actor IntentLedger {
     private let capacity: Int
     private let now: @Sendable () -> Date
     private var intents: [Intent] = []
-    public init(windowSeconds: TimeInterval = 120, capacity: Int = 20, now: @Sendable @escaping () -> Date = Date.init) {
+    public init(windowSeconds: TimeInterval = 120, capacity: Int = 20, now: @Sendable @escaping () -> Date = { Date() }) {
         self.window = windowSeconds; self.capacity = capacity; self.now = now
     }
     @discardableResult
