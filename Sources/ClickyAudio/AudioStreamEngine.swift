@@ -381,7 +381,8 @@ public final class AudioStreamEngine: @unchecked Sendable {
     }
 
     /// Feed decoded 24 kHz PCM (one or more model audio chunks): sliced into 20 ms units,
-    /// converted 24→48 kHz, gated by the adaptive jitter buffer.
+    /// converted to the engine's current playback format (the VPIO input rate), gated by
+    /// the adaptive jitter buffer.
     public func enqueuePlaybackPCM(_ data: Data, sampleRate: Double = 24_000) {
         guard sampleRate > 0, !data.isEmpty else { return }
         processingQueue.async { [weak self] in self?.handlePlayback(data, sampleRate: sampleRate) }
