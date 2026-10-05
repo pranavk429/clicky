@@ -12,23 +12,35 @@ import Foundation
 final class ScriptedDemoRunner {
     private let overlay = GhostCursorController()
     private var client: GeminiLiveClient?
-    private var transport: ScriptedDemoTransport?
+    private var mock: MockSession?
     private var driverTask: Task<Void, Never>?
     private var connectTask: Task<Void, Never>?
     private var cleanupTask: Task<Void, Never>?
     private var hotKey: EscapeHotKey?
     private var running = false
 
-    /// Absolute times from demo start, in seconds, paired with the server frame.
-    private static let timeline: [(TimeInterval, String)] = [
-        (0.5, #"{"setupComplete":{}}"#),
-        (1.2, #"{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"data":"AA==","mimeType":"audio/pcm;rate=24000"}}]}}}"#),
-        (2.6, #"{"toolCall":{"functionCalls":[{"id":"demo-fc-1","name":"preview_action","args":{"target":{"x":0.5,"y":0.42},"label":"Save करो"}}]}}"#),
-        (7.0, #"{"toolCall":{"functionCalls":[{"id":"demo-fc-2","name":"preview_action","args":{"target":{"x":0.3,"y":0.62},"label":"Type: नमस्ते"}}]}}"#),
-    ]
+    /// The demo's scripted server frames as a `MockSession` scenario. Each frame's
+    /// `afterMs` is the delta from the previous frame, so the old absolute beats
+    /// (0.5, 1.2, 2.6, 7.0 s) reproduce as 500 + 700 + 1400 + 4400 ms.
+    private static let scenarioJSON = #"""
+    {
+      "name": "demo-preview-actions",
+      "frames": [
+        { "afterMs": 500,  "json": "{\"setupComplete\":{}}" },
+        { "afterMs": 700,  "json": "{\"serverContent\":{\"modelTurn\":{\"parts\":[{\"inlineData\":{\"data\":\"AA==\",\"mimeType\":\"audio/pcm;rate=24000\"}}]}}}" },
+        { "afterMs": 1400, "json": "{\"toolCall\":{\"functionCalls\":[{\"id\":\"demo-fc-1\",\"name\":\"preview_action\",\"args\":{\"target\":{\"x\":0.5,\"y\":0.42},\"label\":\"Save करो\"}}]}}" },
+        { "afterMs": 4400, "json": "{\"toolCall\":{\"functionCalls\":[{\"id\":\"demo-fc-2\",\"name\":\"preview_action\",\"args\":{\"target\":{\"x\":0.3,\"y\":0.62},\"label\":\"Type: नमस्ते\"}}]}}" }
+      ]
+    }
+    """#
 
     func start() {
         guard !running else { return }
+        guard let mock = try? MockSession(scenarioJSON: Self.scenarioJSON) else {
+            overlay.showOverlay()
+            overlay.setStatus("Demo scenario invalid — stopped")
+            return
+        }
         running = true
         cleanupTask?.cancel()
         cleanupTask = nil
@@ -36,11 +48,10 @@ final class ScriptedDemoRunner {
         overlay.showOverlay()
         overlay.setStatus("Clicky demo — scripted server, real client")
 
-        let transport = ScriptedDemoTransport()
-        self.transport = transport
+        self.mock = mock
 
         let client = GeminiLiveClient(
-            transportFactory: { transport },
+            transportFactory: { mock },
             setupFactory: { _ in GeminiSetupBuilder.make(systemInstruction: "Demo.") },
             toolHandler: DemoToolHandler(overlay: overlay),
             onServerContent: { [weak self] content in
@@ -55,14 +66,10 @@ final class ScriptedDemoRunner {
         self.client = client
 
         driverTask = Task { [weak self] in
-            var previous: TimeInterval = 0
-            for (time, frame) in Self.timeline {
-                do { try await Task.sleep(for: .seconds(time - previous)) } catch { return }
-                previous = time
-                if Task.isCancelled { return }
-                await transport.deliver(frame)
-            }
-            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            // The scenario's four frames land at 0.5 + 0.7 + 1.4 + 4.4 = 7.0 s;
+            // hold 3 s more (7.0 + 3.0 = ≈10.0 s) so the last preview finishes,
+            // then stop. `MockSession` paces each frame by its own `afterMs`.
+            do { try await Task.sleep(for: .seconds(10.0)) } catch { return }
             if Task.isCancelled { return }
             await self?.stop(reason: .userToggle)
         }
@@ -100,7 +107,7 @@ final class ScriptedDemoRunner {
             await client.stop(reason: reason)
         }
         client = nil
-        transport = nil
+        mock = nil
         overlay.dismissConfirmation()
         overlay.showStopped(reason == .killSwitch ? "STOPPED — local stop (no network)" : "Demo complete")
         cleanupTask?.cancel()
