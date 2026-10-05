@@ -54,17 +54,19 @@ public final class KillSwitchManager: @unchecked Sendable {
     /// T7−T1 when the caller supplies the onset instant; nil for the hotkey path.
     public var lastBargeInMilliseconds: Double? { lock.lock(); defer { lock.unlock() }; return lastLatencyMs }
 
-    /// Registers ⌘⇧X. The session-toggle chord is registered by the app.
+    /// Registers ⌘⇧X. Main thread only (Carbon `RegisterEventHotKey`); repeated calls are
+    /// safe — `GlobalHotKey.register()` is idempotent. The session-toggle chord is
+    /// registered by the app.
     @discardableResult
     public func registerKillHotKey() -> OSStatus {
-        if hotKey == nil {
-            let hotKey = GlobalHotKey(hotKeys: [.killSwitch]) { [weak self] action in
-                guard action == .killSwitch else { return }
-                self?.triggerKillSwitch(source: .hotKey)
-            }
-            self.hotKey = hotKey
+        lock.lock()
+        let hotKey = self.hotKey ?? GlobalHotKey(hotKeys: [.killSwitch]) { [weak self] action in
+            guard action == .killSwitch else { return }
+            self?.triggerKillSwitch(source: .hotKey)
         }
-        return hotKey?.register() ?? OSStatus(paramErr)
+        self.hotKey = hotKey
+        lock.unlock()
+        return hotKey.register()
     }
 
     /// Voice path: stop playback and clear queued playback/actions. Returns false while

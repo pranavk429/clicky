@@ -31,6 +31,7 @@ public final class GlobalHotKey: @unchecked Sendable {
         self.hotKeys = hotKeys
         self.onAction = onAction
     }
+    /// Whether the event handler is installed. Main thread only.
     public var isRegistered: Bool { handler != nil }
 
     /// Registers every chord; returns `noErr` or the first Carbon failure. Main thread only.
@@ -57,12 +58,15 @@ public final class GlobalHotKey: @unchecked Sendable {
         return noErr
     }
 
+    /// Unregisters every chord and removes the handler. Main thread only.
     public func unregister() {
         for ref in refs { UnregisterEventHotKey(ref) }
         refs.removeAll()
         if let handler { RemoveEventHandler(handler) }
         handler = nil
     }
+
+    deinit { unregister() }
 
     private func handles(_ action: Action) -> Bool { hotKeys.contains { $0.action == action } }
 

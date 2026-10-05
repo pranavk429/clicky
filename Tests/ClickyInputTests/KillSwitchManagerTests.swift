@@ -6,7 +6,7 @@ final class KillSwitchManagerTests: XCTestCase {
     private final class Recorder: @unchecked Sendable {
         private let lock = NSLock()
         private var recorded: [String] = []
-        var manager: KillSwitchManager?
+        weak var manager: KillSwitchManager?
         func record(_ event: String) { lock.lock(); recorded.append(event); lock.unlock() }
         func snapshot() -> [String] { lock.lock(); defer { lock.unlock() }; return recorded }
     }
