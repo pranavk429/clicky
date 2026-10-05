@@ -11,7 +11,7 @@ Speak naturally in English, Hindi, or Marathi — Clicky shows you what it will 
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![hackathon](https://img.shields.io/badge/hackathon-CraftVerse%202.0%20%C2%B7%20Agentic%20AI-purple)
 
-*Built for the [CraftVerse 2.0 Hackathon](https://github.com/pranavk429/clicky) (PCCOE&R Pune) — Agentic AI track.*
+*Built for the CraftVerse 2.0 Hackathon (PCCOE&R Pune) — Agentic AI track.*
 
 **📐 [System design specification](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md) · 📋 [Research & validation](docs/research) · 🗺️ [Roadmap](#roadmap)**
 
