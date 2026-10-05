@@ -134,7 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopPlayback: { [weak self] in self?.audioSelfTest?.stopPlaybackNow() },
             releaseSyntheticInput: { KillSwitchManager.releaseSyntheticInputNow() },
             presentBanner: { [weak self] text in Task { @MainActor in self?.setNotice(text) } },
-            stopSession: { [weak self] in Task { @MainActor in self?.setNotice("Session stopped — kill switch") } }))
+            // Session stop is wired with the Chunk 13 integration; it must not write
+            // `notice` here — that would overwrite the kill-switch banner presented above.
+            stopSession: { }))
         self.killSwitch = killSwitch
         let killStatus = killSwitch.registerKillHotKey()
         if killStatus != noErr { setNotice("⌘⇧X could not register (OSStatus \(killStatus))") }
