@@ -158,31 +158,44 @@ public final class AudioStreamEngine: @unchecked Sendable {
         defer { lifecycleLock.unlock() }
         lock.lock(); let alreadyRunning = running; lock.unlock()
         guard !alreadyRunning else { return }
-        do { try engine.inputNode.setVoiceProcessingEnabled(true) }
-        catch { throw AudioError.voiceProcessingUnavailable(String(describing: error)) }
-        try connectOutputAnchor()
-        guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: configuration.outputSampleRate,
-                                               channels: 1, interleaved: false) else { throw AudioError.converterUnavailable }
-        lock.lock(); playbackFormat = outputFormat; lock.unlock()
-        if player.engine == nil { engine.attach(player) }
-        engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
-        try installInputTap()
-        // Register before start(): VPIO configures its aggregate device asynchronously, so the
-        // engine may stop itself once right after start ("iounit configuration changed"). The
-        // observer must already be in place so that sweep-up renegotiate() is never missed.
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
-        observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
-                                                          queue: nil) { [weak self] _ in self?.renegotiate() }
-        engine.prepare()
-        do { try engine.start() }
-        catch {
-            // A failed start must not leave the tap installed while `running == false`
-            // (stop() would early-return and never clean it up).
-            if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
-            throw AudioError.engineStartFailed(String(describing: error))
-        }
+        try startWithRetries()
         lock.lock(); running = true; player.play(); lock.unlock()
+    }
+
+    /// Runs the full graph + start sequence with bounded retries. macOS 27 VPIO
+    /// (measured 2026-10-06) configures its aggregate asynchronously and passes through
+    /// transient format states (0 Hz, 5↔7 channels) and reconfiguration windows where
+    /// the AU refuses to initialize ("client-side input and output formats do not
+    /// match", -10875). Requires `lifecycleLock`; must not be called with the state
+    /// `lock` held. The caller sets `running`/`player.play()` on success.
+    private func startWithRetries() throws {
+        var lastError: Error?
+        for attempt in 1...3 {
+            do {
+                do { try engine.inputNode.setVoiceProcessingEnabled(true) }
+                catch { throw AudioError.voiceProcessingUnavailable(String(describing: error)) }
+                let inputFormat = try waitForStableInputFormat()
+                try connectOutputAnchor(inputSampleRate: inputFormat.sampleRate)
+                try prepareGraph(inputSampleRate: inputFormat.sampleRate)
+                // Register before start(): the engine may stop itself right after start
+                // ("iounit configuration changed") while the aggregate settles; the
+                // observer must already be in place so the sweep-up renegotiate() runs.
+                if let observer { NotificationCenter.default.removeObserver(observer) }
+                observer = nil
+                observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
+                                                                  queue: nil) { [weak self] _ in self?.renegotiate() }
+                engine.prepare()
+                try engine.start()
+                return
+            } catch {
+                lastError = error
+                if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+                if engine.isRunning { engine.stop() }
+                log.notice("audio engine start attempt \(attempt, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                if attempt < 3 { Thread.sleep(forTimeInterval: 0.4) }
+            }
+        }
+        throw AudioError.engineStartFailed(String(describing: lastError))
     }
 
     public func stop() {
@@ -200,14 +213,46 @@ public final class AudioStreamEngine: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// macOS VPIO (measured 2026-10-06, macOS 27): the output node only comes
-    /// online with an explicit mixer→output connection; without it the output
-    /// format stays 0 Hz and start() fails with -10875. The stereo client format
-    /// is converted to the hardware rate by the output node.
-    private func connectOutputAnchor() throws {
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: configuration.outputSampleRate,
+    /// macOS VPIO (measured 2026-10-06, macOS 27): the output node only comes online
+    /// with an explicit mixer→output connection, and VPIO requires the client-side
+    /// input and output sample rates to match ("client-side input and output formats
+    /// do not match", -10875). The stereo client format therefore uses the input
+    /// format's rate; the output node converts to the hardware rate.
+    private func connectOutputAnchor(inputSampleRate: Double) throws {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: inputSampleRate,
                                          channels: 2) else { throw AudioError.converterUnavailable }
         engine.connect(engine.mainMixerNode, to: engine.outputNode, format: format)
+    }
+
+    /// Bounded wait for `inputFormat(forBus: 0)` to be valid and stable across two
+    /// consecutive reads. VPIO on macOS 27 reports transient 0 Hz / changing channel
+    /// counts while its aggregate device configures (measured 2026-10-06). Requires
+    /// `lifecycleLock`.
+    private func waitForStableInputFormat() throws -> AVAudioFormat {
+        let deadline = ContinuousClock.now + .seconds(2)
+        var previous = engine.inputNode.inputFormat(forBus: 0)
+        while ContinuousClock.now < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            let current = engine.inputNode.inputFormat(forBus: 0)
+            if current.sampleRate > 0, current.channelCount > 0,
+               current.sampleRate == previous.sampleRate, current.channelCount == previous.channelCount {
+                return current
+            }
+            previous = current
+        }
+        guard previous.sampleRate > 0, previous.channelCount > 0 else { throw AudioError.noInputDevice }
+        return previous
+    }
+
+    /// Player→mixer connection plus the input tap at the current hardware format.
+    /// Requires `lifecycleLock`; called from `start()` and `renegotiate()`.
+    private func prepareGraph(inputSampleRate: Double) throws {
+        guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: inputSampleRate,
+                                               channels: 1, interleaved: false) else { throw AudioError.converterUnavailable }
+        lock.lock(); playbackFormat = outputFormat; lock.unlock()
+        if player.engine == nil { engine.attach(player) }
+        engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
+        try installInputTap()
     }
 
     /// MUST be called with `lifecycleLock` held (from `start()` or `renegotiate()`); it
@@ -216,9 +261,15 @@ public final class AudioStreamEngine: @unchecked Sendable {
         let input = engine.inputNode
         let hardwareFormat = input.inputFormat(forBus: 0)   // actual rate AFTER enabling VP (errata B9)
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else { throw AudioError.noInputDevice }
-        guard let wireFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: configuration.wireSampleRate,
+        // VPIO's input format is a multi-channel duplex format (5–7 ch on macOS 27).
+        // AVAudioConverter silently outputs silence when downmixing it to mono without a
+        // channel layout (measured 2026-10-06); all channels carry the same processed
+        // signal, so tap at the hardware format and convert from a mono channel-0 copy.
+        guard let monoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hardwareFormat.sampleRate,
+                                             channels: 1, interleaved: false),
+              let wireFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: configuration.wireSampleRate,
                                              channels: 1, interleaved: true),
-              let newConverter = AVAudioConverter(from: hardwareFormat, to: wireFormat) else {
+              let newConverter = AVAudioConverter(from: monoFormat, to: wireFormat) else {
             throw AudioError.converterUnavailable
         }
         if tapInstalled { input.removeTap(onBus: 0) }
@@ -234,7 +285,15 @@ public final class AudioStreamEngine: @unchecked Sendable {
     // MARK: Input (tap thread → processingQueue)
 
     private func handleInput(_ buffer: AVAudioPCMBuffer) {
-        guard let converter, buffer.frameLength > 0 else { return }
+        guard let converter, buffer.frameLength > 0,
+              let floatChannel = buffer.floatChannelData?[0] else { return }
+        let frames = Int(buffer.frameLength)
+        guard let monoSource = AVAudioPCMBuffer(pcmFormat: converter.inputFormat,
+                                                frameCapacity: AVAudioFrameCount(frames)) else { return }
+        monoSource.frameLength = AVAudioFrameCount(frames)
+        if let destination = monoSource.floatChannelData?[0] {
+            destination.update(from: floatChannel, count: frames)
+        }
         let ratio = buffer.format.sampleRate / configuration.wireSampleRate
         let capacity = AVAudioFrameCount((Double(buffer.frameLength) / ratio).rounded(.up) + 32)
         guard let converted = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else { return }
@@ -243,7 +302,7 @@ public final class AudioStreamEngine: @unchecked Sendable {
         let status = converter.convert(to: converted, error: &conversionError) { _, statusPointer in
             if consumedInput { statusPointer.pointee = .noDataNow; return nil }
             consumedInput = true; statusPointer.pointee = .haveData
-            return buffer
+            return monoSource
         }
         guard conversionError == nil, status == .haveData || status == .inputRanDry,
               let channel = converted.int16ChannelData?[0], converted.frameLength > 0 else {
@@ -435,12 +494,20 @@ public final class AudioStreamEngine: @unchecked Sendable {
             self.log.notice("AVAudioEngineConfigurationChange — re-negotiating formats")
             self.engine.stop()
             if self.tapInstalled { self.engine.inputNode.removeTap(onBus: 0); self.tapInstalled = false }
+            // Full VPIO reset for the new device set: the old mixer→output anchor pins a
+            // stale client sample rate and keeps the unit from initializing its new
+            // aggregate ("client-side input and output formats do not match", -10875,
+            // measured 2026-10-06). Disable VP, drop the anchor, anchor at the plain input
+            // rate, then let startWithRetries() re-enable VP and rebuild with matching
+            // formats.
+            self.engine.disconnectNodeOutput(self.engine.mainMixerNode)
+            try? self.engine.inputNode.setVoiceProcessingEnabled(false)
+            let plainInputRate = self.engine.inputNode.inputFormat(forBus: 0).sampleRate
+            if plainInputRate > 0 { try? self.connectOutputAnchor(inputSampleRate: plainInputRate) }
             var deviceChange: DeviceChange?
             var restartError: AudioError?
             do {
-                try self.connectOutputAnchor()
-                try self.installInputTap()
-                try self.engine.start()
+                try self.startWithRetries()
                 self.lock.lock(); self.player.play(); self.lock.unlock()
                 deviceChange = DeviceChange(
                     inputSampleRate: self.engine.inputNode.inputFormat(forBus: 0).sampleRate,
