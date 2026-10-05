@@ -63,6 +63,7 @@ public actor GeminiLiveClient {
     private var state: GeminiConnectionState = .idle
     private var transport: (any GeminiTransport)?
     private var receiveTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var connectGeneration = 0
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var setupTimeoutTask: Task<Void, Never>?
@@ -71,12 +72,14 @@ public actor GeminiLiveClient {
     private var resumptionHandle: String?
     private var sawAudioThisTurn = false
     private var endOfSpeechDetector: EndOfSpeechDetector
+    private let sleeper: any SleepProviding
 
     public init(transportFactory: @escaping TransportFactory,
                 setupFactory: @escaping SetupFactory,
                 toolHandler: (any GeminiToolHandling)? = nil,
                 setupTimeout: TimeInterval = 10,
                 vadConfiguration: EndOfSpeechDetector.Configuration = .clickyDefault,
+                sleeper: any SleepProviding = RealSleeper(),
                 onServerContent: (@Sendable (GeminiServerContent) -> Void)? = nil,
                 onNotice: (@Sendable (String) -> Void)? = nil,
                 onMarker: (@Sendable (GeminiMarker) -> Void)? = nil) {
@@ -85,6 +88,7 @@ public actor GeminiLiveClient {
         self.toolHandler = toolHandler
         self.setupTimeout = setupTimeout
         self.endOfSpeechDetector = EndOfSpeechDetector(configuration: vadConfiguration)
+        self.sleeper = sleeper
         self.onServerContent = onServerContent
         self.onNotice = onNotice
         self.onMarker = onMarker
@@ -118,6 +122,12 @@ public actor GeminiLiveClient {
         // Mark stopped FIRST: the receive-loop failure handler must see `.stopped`
         // and return — no spurious "Connection lost." and no reconnect for a stop.
         state = .stopped(reason: reason)
+        // Supersede any in-flight handshake or reconnect attempt: bumping the
+        // generation makes a settling `establish`/`performReconnect` observe that
+        // it has been superseded instead of acting on the stopped session.
+        connectGeneration += 1
+        reconnectTask?.cancel()
+        reconnectTask = nil
         // Resolve a pending handshake deterministically: after the transport is
         // closed the receive task may never execute its first loop iteration
         // (legal scheduling), so stop() itself must fail the handshake.
@@ -196,7 +206,14 @@ public actor GeminiLiveClient {
 
     private func establish(handle: String?) async throws {
         connectGeneration += 1
-        if handle == nil { cancelledToolCallIDs.removeAll() }   // fresh session: old cancellations cannot apply
+        if handle == nil {
+            // Fresh session: old cancellations cannot apply, and the new server
+            // session starts a clean turn with a recreated VAD detector. A resume
+            // (`handle != nil`) keeps both — the server session continues.
+            cancelledToolCallIDs.removeAll()
+            sawAudioThisTurn = false
+            endOfSpeechDetector = EndOfSpeechDetector(configuration: endOfSpeechDetector.configuration)
+        }
         let generation = connectGeneration
         await transport?.close()
         do {
@@ -255,6 +272,9 @@ public actor GeminiLiveClient {
         while generation == connectGeneration, let transport {
             do {
                 let data = try await transport.receive()
+                // A buffered frame can still arrive after a stop() superseded this
+                // loop; applying it would advance the stopped/new session's state.
+                guard generation == connectGeneration else { return }
                 handleFrame(data)
             } catch {
                 if generation == connectGeneration { handleTransportFailure() }
@@ -308,7 +328,9 @@ public actor GeminiLiveClient {
     }
 
     private func handleGoAway(timeLeftSeconds: Double?) {
-        onNotice?("The server will close this connection soon.")
+        onNotice?("The server will close this connection — reconnecting before it drops.")
+        beginReconnect(after: ReconnectPolicy.goAwayDelay(timeLeftSeconds: timeLeftSeconds),
+                       handle: resumptionHandle)
     }
 
     private func handleTransportFailure() {
@@ -318,16 +340,15 @@ public actor GeminiLiveClient {
         }
         setupTimeoutTask?.cancel()
         setupTimeoutTask = nil
-        switch state {
-        case .idle, .stopped: return
-        case .connecting, .ready, .reconnecting: break
-        }
-        state = .stopped(reason: .networkFailure)
-        onNotice?("Connection lost.")
+        guard state == .ready else { return }   // connect-phase failures surface via establish()
+        onNotice?("Connection lost — reconnecting.")
         dropInFlightToolCalls(reason: "connection lost")
+        // Close the transport that actually failed rather than re-reading the
+        // property (a successor may already have installed its own).
         let doomed = transport
         transport = nil
         if let doomed { Task { await doomed.close() } }
+        beginReconnect(after: ReconnectPolicy.backoffDelay(attempt: 1), handle: resumptionHandle)
     }
 
     // MARK: Tool calls (dispatch never blocks the receive loop)
@@ -361,6 +382,9 @@ public actor GeminiLiveClient {
             try await transmit(.toolResponse(GeminiToolResponse(functionResponses: [response])))
         } catch {
             cancelledToolCallIDs.insert(id)
+            // A stopped session is not "busy" — stop() already dropped this call
+            // and cancelled its task; only surface the busy notice for a live session.
+            if case .stopped = state { return }
             onNotice?("A tool result could not be delivered — the connection was busy.")
         }
     }
@@ -372,5 +396,46 @@ public actor GeminiLiveClient {
             onMarker?(.toolCallDropped(id: id, reason: reason))
         }
         inFlightToolTasks.removeAll()
+    }
+
+    // MARK: Reconnect (goAway + transport loss)
+
+    private func beginReconnect(after delay: TimeInterval, handle: String?) {
+        guard reconnectTask == nil else { return }
+        reconnectTask = Task { await self.performReconnect(after: delay, handle: handle) }
+    }
+
+    private func performReconnect(after initialDelay: TimeInterval, handle: String?) async {
+        defer { reconnectTask = nil }
+        var attempt = 0
+        var useFreshSession = (handle == nil)
+        var delay = initialDelay
+        while !Task.isCancelled {
+            attempt += 1
+            state = .reconnecting(attempt: attempt)
+            do { try await sleeper.sleep(seconds: delay) } catch { return }
+            delay = ReconnectPolicy.backoffDelay(attempt: attempt + 1)
+            do {
+                let generation = connectGeneration + 1
+                try await establish(handle: useFreshSession ? nil : handle)
+                // A stop()/start() that landed while this attempt was settling has
+                // already closed/niled its transport and owns the newer state;
+                // touching `transport` or `state` here would corrupt that session.
+                guard generation == connectGeneration else { return }
+                onNotice?(useFreshSession ? "New session started." : "Reconnected.")
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                guard attempt >= ReconnectPolicy.maxResumeAttempts else { continue }
+                if useFreshSession {
+                    onNotice?("Connection lost — stopping.")
+                    await stop(reason: .networkFailure)
+                    return
+                }
+                useFreshSession = true
+                attempt = 0
+                onNotice?("Could not resume the session — starting a fresh one.")
+            }
+        }
     }
 }
