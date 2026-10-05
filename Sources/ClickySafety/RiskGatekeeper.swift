@@ -45,8 +45,10 @@ public enum RiskGatekeeper {
             // Inspection posts no hardware events, and macOS suppresses secure
             // field values to external clients; redaction/vision policy lives
             // downstream, not in the action gate.
-            return RiskClassification(tier: modelRequestedTier.map { max(.read, $0) } ?? .read,
-                                      reasons: ["action:read"], isEgress: false)
+            let tier = modelRequestedTier.map { max(.read, $0) } ?? .read
+            var reasons = ["action:read"]
+            if let requested = modelRequestedTier, requested > .read { reasons.append("model-raised:\(requested.rawValue)") }
+            return RiskClassification(tier: tier, reasons: reasons, isEgress: false)
         }
         var tier = baseTier(context.action)
         var reasons = ["action:\(context.action)"]
@@ -75,7 +77,7 @@ public enum RiskGatekeeper {
                 tier = .prohibited; reasons.append("title:credential-or-terminal")
             } else if financialActions.contains(context.action),
                       SafetyText.containsAny(financialTitleKeywords, in: title) {
-                tier = .financial; reasons.append("title:financial")
+                tier = max(tier, .financial); reasons.append("title:financial")
             }
         }
         if let requested = modelRequestedTier, requested > tier { reasons.append("model-raised:\(requested.rawValue)") }
