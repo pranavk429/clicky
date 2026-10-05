@@ -15,6 +15,7 @@ import Foundation
 @MainActor
 final class LiveConversationRunner {
     let overlay = GhostCursorController()
+    let gate = DemoClickGate()
 
     private var client: GeminiLiveClient?
     private var mic: MicrophoneCapture?
@@ -28,7 +29,7 @@ final class LiveConversationRunner {
     /// Menu insurance; barge-in disabled by design in this mode — Esc still stops.
     var halfDuplex = false
 
-    nonisolated static let systemInstruction = "You are Clicky, a live voice copilot inside a menu-bar app on this Mac. English only in this build. Speak like a quick, warm conversation partner: one or two short spoken sentences per reply, never a monologue. Actions available in this build: switch_app (open or switch to an app), type_text (type text into the frontmost app after activating it). Use a tool when the user asks for an action, and report the real outcome — the local computer confirms what happened, so never claim an action unless its tool result came back. If you cannot do something (other languages, screen reading, payments, files), say plainly that this build cannot do it yet. The user may interrupt you at any moment; that is expected — stop and listen."
+    nonisolated static let systemInstruction = "You are Clicky, a live voice copilot inside a menu-bar app on this Mac. English only in this build. Speak like a quick, warm conversation partner: one or two short spoken sentences per reply, never a monologue. Actions available in this build: switch_app (open or switch to an app), type_text (type text into the frontmost app after activating it), click_demo_button (a real click on Clicky's own on-screen demo panel, after the user confirms it). Use a tool when the user asks for an action, and report the real outcome — the local computer confirms what happened, so never claim an action unless its tool result came back. If you cannot do something (other languages, screen reading, payments, files), say plainly that this build cannot do it yet. The user may interrupt you at any moment; that is expected — stop and listen."
 
     nonisolated static let tools: [GeminiTool] = [
         GeminiTool(functionDeclarations: [
@@ -61,6 +62,14 @@ final class LiveConversationRunner {
                         ])
                     ]),
                     "required": .array([.string("text")])
+                ])),
+            GeminiFunctionDeclaration(
+                name: "click_demo_button",
+                description: "Click Clicky's own on-screen demo panel after the user confirms with the keyboard.",
+                parameters: .object([
+                    "type": .string("object"),
+                    "properties": .object([:]),
+                    "required": .array([])
                 ]))
         ])
     ]
@@ -90,6 +99,7 @@ final class LiveConversationRunner {
         self.player = player
         overlay.hideOverlay()   // clear a stale stopped banner from a quick re-run
         overlay.showOverlay()
+        gate.showPanel()
         overlay.setStatus("Connecting — live English slice")
 
         let mic = MicrophoneCapture()
@@ -118,7 +128,7 @@ final class LiveConversationRunner {
                                         tools: Self.tools,
                                         resumptionHandle: handle)
             },
-            toolHandler: LiveToolHandler(overlay: overlay),
+            toolHandler: LiveToolHandler(overlay: overlay, gate: gate),
             onServerContent: { [weak self] content in
                 Task { @MainActor in self?.handleServerContent(content) }
             },
@@ -165,6 +175,8 @@ final class LiveConversationRunner {
         audioTask?.cancel()
         mic?.stop()
         player?.stopAll()
+        gate.cancelPending()
+        gate.hidePanel()
         if let client {
             await client.stop(reason: reason)
         }
@@ -212,6 +224,7 @@ final class LiveConversationRunner {
 /// path from speech and never leaves the three allowed application folders.
 private struct LiveToolHandler: GeminiToolHandling {
     let overlay: GhostCursorController
+    let gate: DemoClickGate
 
     func execute(_ call: GeminiToolCall.FunctionCall) async throws -> GeminiToolHandlerResult {
         switch call.name {
@@ -219,6 +232,8 @@ private struct LiveToolHandler: GeminiToolHandling {
             return await switchApp(call)
         case "type_text":
             return await Self.typeText(call, overlay: overlay)
+        case "click_demo_button":
+            return await Self.clickDemoButton(overlay: overlay, gate: gate)
         default:
             return GeminiToolHandlerResult(
                 payload: .object(["status": .string("error"),
@@ -279,6 +294,32 @@ private struct LiveToolHandler: GeminiToolHandling {
         await overlay.setIntent(nil)
         await overlay.flashAction("Typed \(text.count) characters")
         return GeminiToolHandlerResult(payload: .object(["status": .string("typed")]), scheduling: .whenIdle)
+    }
+
+    private static func clickDemoButton(overlay: GhostCursorController,
+                                        gate: DemoClickGate) async -> GeminiToolHandlerResult {
+        await MainActor.run { gate.beginGate() }
+        let point = await MainActor.run { gate.buttonScreenCenter() }
+        await overlay.setIntent("Click: Clicky's own demo panel")
+        await overlay.moveCursor(to: point, duration: 0.8)
+        await overlay.showConfirmation("Press ⏎ to confirm — Esc stops the session")
+        let confirmed = await gate.requestConfirmation()
+        await overlay.dismissConfirmation()
+        guard confirmed else {
+            await overlay.setIntent(nil)
+            await overlay.flashAction("Click cancelled — nothing was clicked")
+            return GeminiToolHandlerResult(payload: .object(["status": .string("cancelled")]), scheduling: .interrupted)
+        }
+        _ = await MainActor.run { gate.performRealClick(at: point) }
+        try? await Task.sleep(for: .milliseconds(200))
+        let landed = await MainActor.run { gate.didFire }
+        await overlay.setIntent(nil)
+        await overlay.flashAction(landed ? "Real click landed on Clicky's own panel"
+                                         : "Click not confirmed — claiming nothing")
+        return GeminiToolHandlerResult(
+            payload: .object(["status": .string(landed ? "clicked" : "unconfirmed"),
+                              "target": .string("clicky_demo_panel")]),
+            scheduling: .whenIdle)
     }
 
     /// Shared error result for the tool handlers in this file.
