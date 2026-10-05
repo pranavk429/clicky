@@ -10556,6 +10556,8 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-12-tool-router`. Do not start 
 
 **Spec sections:** §3 (end-to-end wiring), §4.1 (activation model), §4.4 (dual kill switch, T10 containment), §6 (demo insurance); errata A8. **Est. 1.5 h.**
 
+> **Erratum (2026-10-06, recorded during Chunk 6 completion — flagged by the Chunk 6 chunk review):** Task 13.1's `IntegrationAdapters.swift` sketch (Step 2) and its Step 6 assertion ("maps directly to the real landed public interfaces") do not match the landed Chunk 6 accessibility interfaces; the sketch retains its original form and must be adapted before implementation. Mismatches: no-arg `AXTreeCrawler()`/`AXHotCache()` — landed inits are `init(source:)`/`init(crawler:)`; `snapshot(pid:maxNodes:)` — landed is `snapshot(focusedWindowOf: pid_t) -> [ElementSnapshot]`; `lookup(title:)` — landed is `lookup(_ query: ElementQuery) -> ScoredElement?`; `ElementSnapshot` exposes `element`, `key` (role/subrole/title/description), `frame` (already the global top-left CG frame), `isEnabled`, `isSecureField`, `actions`, `normalizedPoint` — it exposes no `applicationName`, `windowTitle`, `fileURL` or separate `cgFrame`. **Open decisions (user sign-off required before Chunk 13):** (a) `applicationName`/`windowTitle` for `ScreenContext` — derivable from `NSRunningApplication` plus the crawled `AXWindow` snapshot's title, but the adaptation choice must be confirmed; (b) the Tier-3 delete path's `fileURL` — `ElementSnapshot`/`RealAXNode` carry no URL attribute, so it needs a user-approved design decision (dedicated read/extension) before Chunk 13. Bundle both with the Chunk 6 depth-5 Electron-coverage flag.
+
 ---
 
 ### Task 13.1: AppState end-to-end wiring + mock-through-router (~55 min)
