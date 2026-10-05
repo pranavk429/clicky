@@ -5,6 +5,10 @@
 > the tool-dispatch path, the marker emission, and the ghost-cursor overlay are the real
 > implementation. **No network, AX, event-synthesis, or audio calls happen in this slice.**
 > No performance number below is measured — the latency meter ships in Chunk 14.
+>
+> **Update (2026-10-05, after Chunk 5):** the app-side `ScriptedDemoTransport` was replaced by
+> `ClickyGemini.MockSession` (same beats, labels and timings; still no socket). The `46/46`
+> test line below is the round-2 measurement — see the README for the current measured line.
 
 ## Run commands (before the conversation starts)
 
@@ -50,7 +54,7 @@ confirmation phrases are in the demo itself, not an afterthought."
 
 - `swift build -c release` → `Build complete!`, 0 warnings · `swift test` → 46/46, 0 failures.
 - "Scripted server, real pipeline": `Sources/ClickyGemini/` is the real client and protocol;
-  `ScriptedDemoTransport` is the only scripted component (it never opens a socket).
+  `ClickyGemini.MockSession` (replacing the round-2 `ScriptedDemoTransport`) is the only scripted component (it never opens a socket).
 - The confirm-before-act model: the preview never performs a click, type, AX read, or CGEvent.
 - Latency/cost figures: **not measured yet** — latency meter is Chunk 14. Do not quote any.
 
