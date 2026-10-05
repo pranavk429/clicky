@@ -37,7 +37,8 @@ final class GeminiReconnectTests: XCTestCase {
     }
 
     func testCachesOnlyResumableHandlesAndResumesOnGoAway() async throws {
-        let first = FakeTransport(scriptedFrames: [WireFrames.setupComplete,
+        let first = FakeTransport(scriptedFrames: [WireFrames.goAway("10s"),   // during connecting: must be ignored
+                                                   WireFrames.setupComplete,
                                                    WireFrames.resumptionUpdate(handle: "H1", resumable: true),
                                                    WireFrames.resumptionUpdate(handle: "H2", resumable: false),
                                                    WireFrames.goAway("10s")])
@@ -50,6 +51,8 @@ final class GeminiReconnectTests: XCTestCase {
                                       sleeper: sleeper,
                                       onNotice: { text in Task { await notices.record(text) } })
         try await client.start()
+        // The regression element is the early goAway above, received while
+        // `state == .connecting`: it must be ignored, not start a reconnect.
         let secondSetup = await second.waitForSent(count: 1, timeout: 3)
         XCTAssertEqual(secondSetup?.count, 1, "client must reconnect to the queued transport")
         XCTAssertTrue((secondSetup ?? []).first?.contains(#""handle":"H1""#) == true,

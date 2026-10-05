@@ -358,6 +358,10 @@ public actor GeminiLiveClient {
     }
 
     private func handleGoAway(timeLeftSeconds: Double?) {
+        // A goAway is only meaningful for an established session: during a
+        // handshake a reconnect attempt would clobber the parked continuation
+        // (a conforming server sends setupComplete first).
+        guard state == .ready else { return }
         onNotice?("The server will close this connection — reconnecting before it drops.")
         beginReconnect(after: ReconnectPolicy.goAwayDelay(timeLeftSeconds: timeLeftSeconds),
                        handle: resumptionHandle)
