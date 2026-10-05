@@ -90,9 +90,12 @@ public struct SystemElementServices: ElementServices {
         var posVal: CFTypeRef?, sizeVal: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posVal) == .success,
               AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeVal) == .success,
-              let posVal, let sizeVal else { return nil }
+              let posVal, let sizeVal,
+              CFGetTypeID(posVal) == AXValueGetTypeID(), AXValueGetType(posVal as! AXValue) == .cgPoint,
+              CFGetTypeID(sizeVal) == AXValueGetTypeID(), AXValueGetType(sizeVal as! AXValue) == .cgSize else { return nil }
         var pos = CGPoint.zero, size = CGSize.zero
-        AXValueGetValue(posVal as! AXValue, .cgPoint, &pos); AXValueGetValue(sizeVal as! AXValue, .cgSize, &size)
+        guard AXValueGetValue(posVal as! AXValue, .cgPoint, &pos),
+              AXValueGetValue(sizeVal as! AXValue, .cgSize, &size) else { return nil }
         return CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
     }
 }
