@@ -115,8 +115,17 @@ public actor GeminiLiveClient {
         // Mark stopped FIRST: the receive-loop failure handler must see `.stopped`
         // and return — no spurious "Connection lost." and no reconnect for a stop.
         state = .stopped(reason: reason)
+        // Resolve a pending handshake deterministically: after the transport is
+        // closed the receive task may never execute its first loop iteration
+        // (legal scheduling), so stop() itself must fail the handshake.
+        if let continuation = readyContinuation {
+            readyContinuation = nil
+            continuation.resume(throwing: GeminiClientError.transportUnavailable)
+        }
         receiveTask?.cancel()
         receiveTask = nil
+        setupTimeoutTask?.cancel()
+        setupTimeoutTask = nil
         dropInFlightToolCalls(reason: "session stopped")
         await transport?.close()
         transport = nil
@@ -170,6 +179,7 @@ public actor GeminiLiveClient {
 
     private func establish(handle: String?) async throws {
         connectGeneration += 1
+        if handle == nil { cancelledToolCallIDs.removeAll() }   // fresh session: old cancellations cannot apply
         let generation = connectGeneration
         await transport?.close()
         do {
@@ -188,6 +198,8 @@ public actor GeminiLiveClient {
         } catch {
             receiveTask?.cancel()
             receiveTask = nil
+            setupTimeoutTask?.cancel()
+            setupTimeoutTask = nil
             await transport?.close()
             transport = nil
             throw error
@@ -195,17 +207,20 @@ public actor GeminiLiveClient {
     }
 
     private func awaitSetupComplete() async throws {
+        let generation = connectGeneration
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             readyContinuation = continuation
             let timeout = setupTimeout
             setupTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                await self?.setupTimedOut()
+                do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) }
+                catch { return }
+                await self?.setupTimedOut(generation: generation)
             }
         }
     }
 
-    private func setupTimedOut() {
+    private func setupTimedOut(generation: Int) {
+        guard generation == connectGeneration else { return }
         guard let continuation = readyContinuation else { return }
         readyContinuation = nil
         continuation.resume(throwing: GeminiClientError.setupTimeout)
@@ -284,6 +299,8 @@ public actor GeminiLiveClient {
             readyContinuation = nil
             continuation.resume(throwing: GeminiClientError.transportUnavailable)
         }
+        setupTimeoutTask?.cancel()
+        setupTimeoutTask = nil
         switch state {
         case .idle, .stopped: return
         case .connecting, .ready, .reconnecting: break
@@ -291,7 +308,9 @@ public actor GeminiLiveClient {
         state = .stopped(reason: .networkFailure)
         onNotice?("Connection lost.")
         dropInFlightToolCalls(reason: "connection lost")
-        Task { await self.transport?.close() }
+        let doomed = transport
+        transport = nil
+        if let doomed { Task { await doomed.close() } }
     }
 
     // MARK: Tool calls (dispatch never blocks the receive loop)
@@ -319,7 +338,7 @@ public actor GeminiLiveClient {
 
     private func finishToolCall(id: String, name: String, result: GeminiToolHandlerResult) async {
         inFlightToolTasks.removeValue(forKey: id)
-        guard !cancelledToolCallIDs.contains(id) else { return }
+        guard !Task.isCancelled, !cancelledToolCallIDs.contains(id) else { return }
         let response = GeminiFunctionResponse(id: id, name: name, response: result.payload, scheduling: result.scheduling)
         do {
             try await transmit(.toolResponse(GeminiToolResponse(functionResponses: [response])))
