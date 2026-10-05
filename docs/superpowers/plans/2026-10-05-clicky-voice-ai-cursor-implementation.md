@@ -1352,6 +1352,11 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-2-foundation-b`. Do not start 
 
 **Spec sections:** §4.1 (wire format); errata A1 (`models/gemini-3.8-live`), A2 (`behavior: "NON_BLOCKING"` declaration), A3 (`realtimeInput.audio`/`.video` single blobs; never `mediaChunks`), A4 (constrained endpoint is `v1beta`), A9 (`INTERRUPTED` spelling; top-level `scheduling` placement flagged for Spike 5.3). **Est. 1.5 h.**
 
+> **Erratum (2026-10-05, recorded during Chunk 3 execution):** the Task 3.2 `FakeTransport` code block required a correctness fix prompted by the code-quality review (not a compile fix); the committed code uses the corrected forms:
+> - Task 3.2 `FakeTransport.waitForSent`: `try? await Task.sleep(...)` swallowed the cancellation from `defer { timeoutTask.cancel() }`, so the cancelled task fell through to `timeoutWaiters()`, which flushed **every** pending waiter with `nil` (false nils for any concurrent `waitForSent`). Fixed with a per-waiter identity (`nextWaiterID`), a `do { try await Task.sleep(...) } catch { return }` guard, and `timeoutWaiter(id:)` that resumes only its own waiter (no-op if that waiter was already satisfied and removed). `Sources/ClickyGemini/GeminiTransport.swift` is unchanged from the block below.
+> - Task 3.2 `FakeTransportTests`: `testCloseMakesReceiveThrowAndSendIsRecorded` was extended in place (after `finishIncoming()` + the receive-throws check it now calls `close()` and asserts `send` throws `.closed`, while `sentStrings() == ["out"]` still holds — no rename, no extra test case); one regression test was added — `testSatisfiedWaiterDoesNotFlushOtherPendingWaiters` (verified to fail in 0.128 s against the complete pre-fix code, green with the fix); the regression test hoists `await satisfied.value` out of the `XCTAssertEqual` autoclosure (async access is not permitted in XCTest autoclosures under the Swift 5 language mode).
+> - Consequence for the Task 3.3 acceptance expectations below: transport tests are **4** (not 3); the full suite is **30** tests (14 foundation + 12 protocol + 4 transport); the filtered Gemini suite is **17** tests (1 pacing + 12 protocol + 4 transport). The task text retains the original numbers.
+
 ---
 
 ### Task 3.1: GeminiProtocolTypes (Codable) + wire fixtures
