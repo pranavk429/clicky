@@ -663,6 +663,10 @@ Expected: `git tag --list 'chunk-*'` shows `chunk-1-foundation-a` and the GitHub
 
 **Spec sections:** §4.6 (setup/signing/TCC), §5; errata B14/B15/B16. **Est. 2 h.** (The ⌘⇧Space global hotkey arrives with the Carbon utility in Chunk 9; the menu toggle covers this chunk.)
 
+> **Erratum (2026-10-05, recorded during Chunk 2 execution):** two code blocks below required compile-level corrections on the verified toolchain (Swift 6.4 / macOS 26 SDK); the committed code uses the corrected forms:
+> - Task 2.1 `AppState.swift`: `import Combine` alone does not bring `Notification`/`NotificationCenter` into scope under Swift 6 — add `import Foundation` as the first line.
+> - Task 2.2 `PermissionsCenter.preflightAutomation`: `AECreateDesc` is imported as returning `OSErr` (`Int16`) while the function returns `OSStatus` (`Int32`) — the early return must read `return OSStatus(created)`.
+
 ---
 
 ### Task 2.1: Menu-bar shell + session state (~45 min)
