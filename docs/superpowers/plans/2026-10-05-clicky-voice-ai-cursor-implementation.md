@@ -3800,6 +3800,514 @@ git tag --list 'chunk-*'
 ```
 
 Expected: `git tag --list` prints `chunk-1-foundation-a`, `chunk-2-foundation-b`, `chunk-3-gemini-protocol`, `chunk-4-gemini-client-core`, and `chunk-5-gemini-resilience`. Do not start Chunk 6 before the chunk reviewer approves.
+
+---
+
+## Chunk 5.5: Live English conversation slice — user-approved insertion (2026-10-05)
+
+> **Dated note (2026-10-05, user-approved):** inserted at the user's direction because evaluation round 2 needs a live, interactive demonstration — you talk, it talks back, you interrupt it mid-reply and it stops instantly and adapts, and actions happen *inside* the conversation, never as a one-shot "open app" trigger. It changes nothing else; it is absorbed/retired later by Chunks 9–13 (Chunk 9 `GlobalHotKey`; Chunk 10 `AudioStreamEngine`; Chunk 11 the full overlay; Chunk 12 the snippet router + spoken confirmation; Chunk 14 the real meter); it carries **no chunk tag**, and makes **no architecture, safety-model, or scope-cut-ordering changes**. The scripted Chunk 4.5 demo (`--scripted-demo`) keeps working as the emergency backup. Deliberately **English-only** (no Hindi/Marathi tuning — user decision to reduce load); **no AX crawler, no vision, no screen understanding**. Honest label everywhere: **"live conversation slice — English; Tier 1–2 real actions; Tier 3+ previews/gates only"**. Never cut: the Esc local stop.
+
+**Goal:** the lowest-latency honest slice of the real product — full-duplex live conversation through the real `GeminiLiveClient`, instant barge-in playback stop, Esc hard local stop, one real Tier-2 action (`switch_app` via `NSWorkspace`), the Ghost Cursor HUD (listening/speaking/intent/stopped), and the last-turn voice-turn leg (T3→T4) with its exact label.
+
+**Waves (execute W1 first; W2/W3 as time allows):**
+- **W1 (must):** full-duplex conversation · instant barge-in stop · Esc hard local stop · `switch_app` · HUD · echo ladder (1. `AVAudioEngine` voice processing AEC → 2. half-duplex menu toggle → 3. headphones guidance; half-duplex ships in W1 because it is cheap).
+- **W2:** `type_text` via `CGEvent` Unicode keystrokes using the tested `UnicodeChunker` (activate the target app first; refuse when secure input is on); a controlled real click on Clicky's **own** demo panel — glide → confirmation gate → keyboard confirm (spec §4.4 "voice-first, not voice-only"; Validation 03 §4 #2/#6: the sanctioned first-class fallback for the spoken gate) → real `CGEvent` click; run sheet.
+- **W3:** latency chip; insurance notes (hotspot, backup recording); acceptance.
+
+**Files (exact):** Create `Sources/ClickyApp/EscapeHotKey.swift` (internal; extracted from `ScriptedDemoRunner.swift`) · `Sources/ClickyAudio/PCMChunks.swift` + `Tests/ClickyAudioTests/PCMChunksTests.swift` (**6 tests**) · `Sources/ClickyAudio/MicrophoneCapture.swift` · `Sources/ClickyAudio/StreamingAudioPlayer.swift` · `Sources/ClickyApp/LiveConversationRunner.swift` · `Sources/ClickyApp/DemoClickGate.swift` (W2) · `docs/demo/live-slice-run-sheet.md` (W2/W3). Modify `Sources/ClickyApp/ScriptedDemoRunner.swift` (shared hotkey; no behavior change) · `Sources/ClickyApp/AppDelegate.swift` (menu + `--live-demo`). **`Package.swift` must NOT change** (ClickyAudio already has a test target; ClickyApp already depends on every module used). Do not touch `README.md`, `docs/superpowers/specs/**`, `docs/research/**`, `scripts/`, `Resources/`, or any other module. Every file here is provisional: the later chunks named above absorb or retire them rather than duplicate them. Engine/OS files carry frozen interfaces + exact required behavior; bodies are written completely (no placeholders) and verified by `[manual OS check]` — no fake tests.
+
+---
+
+### Task 5.5.1: Extract `EscapeHotKey` for reuse (~10 min)
+
+**Files:** Create `Sources/ClickyApp/EscapeHotKey.swift` · Modify `Sources/ClickyApp/ScriptedDemoRunner.swift`.
+
+- [ ] **Step 1: Move the class unchanged** `[manual OS check]`
+
+Cut `private final class EscapeHotKey { … }` (ScriptedDemoRunner.swift ~189–227) verbatim; drop `private`; add `import Carbon.HIToolbox`; adjust only the first doc-comment line to say it is shared by the scripted demo and the live runner. Signature `0x434C4B59` (`'CLKY'`), `id: 1`, uninstall teardown and `deinit { uninstall() }` stay byte-identical. Keep `import Carbon.HIToolbox` in `ScriptedDemoRunner.swift` for `GetApplicationEventTarget()`.
+
+- [ ] **Step 2: Build + scripted demo smoke check** `[manual OS check]`
+
+Run: `swift build 2>&1 | tail -2` → `Build complete!`. Then `swift run ClickyApp --scripted-demo` + Esc → same green `STOPPED — local stop (no network)` banner as before.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add Sources/ClickyApp/EscapeHotKey.swift Sources/ClickyApp/ScriptedDemoRunner.swift
+git commit -m "refactor(app): extract escape hotkey from scripted demo runner"
+```
+
+---
+
+### Task 5.5.2: `PCMChunks` — pure buffer math (TDD, ~20 min)
+
+**Files:** Create `Tests/ClickyAudioTests/PCMChunksTests.swift` · `Sources/ClickyAudio/PCMChunks.swift`.
+
+- [ ] **Step 1: Write the failing tests** `[unit test]`
+
+```swift
+// Tests/ClickyAudioTests/PCMChunksTests.swift
+import XCTest
+@testable import ClickyAudio
+
+final class PCMChunksTests: XCTestCase {
+    func testDecodesBase64ToLittleEndianSamples() {
+        XCTAssertEqual(PCMChunks.samples(fromBase64: "AQD//w=="), [1, -1])   // 0x01 0x00 0xFF 0xFF
+    }
+    func testEncodesAndDecodesRoundTripPreservingExtremes() {
+        let samples: [Int16] = [Int16.min, -2, 0, 2, Int16.max]
+        let data = PCMChunks.littleEndianData(from: samples)
+        XCTAssertEqual(data, Data([0x00, 0x80, 0xFE, 0xFF, 0x00, 0x00, 0x02, 0x00, 0xFF, 0x7F]))
+        XCTAssertEqual(PCMChunks.samples(fromLittleEndianData: data), samples)
+    }
+    func testFlattensMultipleBase64ChunksInOrder() {
+        XCTAssertEqual(PCMChunks.samples(fromBase64Chunks: ["AQAAAA==", "AgAAAA=="]), [1, 0, 2, 0])
+    }
+    func testMalformedOrOddInputReturnsEmptyInsteadOfCrashing() {
+        XCTAssertEqual(PCMChunks.samples(fromBase64: "!!!"), [])
+        XCTAssertEqual(PCMChunks.samples(fromLittleEndianData: Data([0x01])), [])
+    }
+    func testFrameFeederEmitsExactFramesAndHoldsRemainder() {
+        var feeder = PCMChunks.FrameFeeder()
+        let frames = feeder.feed([Int16](repeating: 7, count: 700))
+        XCTAssertEqual(frames.count, 2)
+        XCTAssertTrue(frames.allSatisfy { $0.count == 320 && $0.allSatisfy { $0 == 7 } })
+        XCTAssertEqual(feeder.remainder.count, 60)
+    }
+    func testFrameFeederCarriesRemainderAcrossFeeds() {
+        var feeder = PCMChunks.FrameFeeder()
+        XCTAssertEqual(feeder.feed([Int16](repeating: 1, count: 200)).count, 0)
+        let frames = feeder.feed([Int16](repeating: 2, count: 120))
+        XCTAssertEqual(frames.count, 1)
+        XCTAssertEqual(frames[0][199], 1)
+        XCTAssertEqual(frames[0][200], 2)
+        XCTAssertEqual(feeder.remainder.count, 0)
+    }
+}
+```
+
+- [ ] **Step 2: Run — expect failure** `[unit test]`
+
+Run: `swift test --filter PCMChunksTests 2>&1 | tail -3` → build error `cannot find 'PCMChunks' in scope`.
+
+- [ ] **Step 3: Implement `PCMChunks.swift`**
+
+```swift
+import Foundation
+
+/// Pure buffer math for the live audio path (Chunk 5.5 insertion): base64 wire
+/// payloads ↔ 16-bit little-endian samples, and exact 20 ms frame feeding.
+/// Chunk 10's `AudioStreamEngine` absorbs or retires this helper.
+public enum PCMChunks {
+    /// The wire frame the live slice feeds: 20 ms at 16 kHz.
+    public static let defaultFrameSampleCount = 320
+
+    public static func samples(fromBase64 base64: String) -> [Int16] {
+        guard let data = Data(base64Encoded: base64) else { return [] }
+        return samples(fromLittleEndianData: data)
+    }
+    public static func samples(fromBase64Chunks chunks: [String]) -> [Int16] {
+        chunks.flatMap(samples(fromBase64:))
+    }
+    public static func samples(fromLittleEndianData data: Data) -> [Int16] {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 2 else { return [] }
+        var samples: [Int16] = []
+        samples.reserveCapacity(bytes.count / 2)
+        var index = 0
+        while index + 1 < bytes.count {
+            samples.append(Int16(bitPattern: UInt16(bytes[index]) | UInt16(bytes[index + 1]) << 8))
+            index += 2
+        }
+        return samples
+    }
+    public static func littleEndianData(from samples: [Int16]) -> Data {
+        var data = Data(capacity: samples.count * 2)
+        for sample in samples { withUnsafeBytes(of: sample.littleEndian) { data.append(contentsOf: $0) } }
+        return data
+    }
+
+    /// Accumulates arbitrary sample counts and yields exact-size frames; the
+    /// remainder is carried until the next feed (the 20 ms chunk boundary).
+    public struct FrameFeeder: Sendable {
+        public let frameSampleCount: Int
+        private var pending: [Int16] = []
+        public init(frameSampleCount: Int = PCMChunks.defaultFrameSampleCount) {
+            self.frameSampleCount = frameSampleCount
+        }
+        public mutating func feed(_ samples: [Int16]) -> [[Int16]] {
+            pending.append(contentsOf: samples)
+            var frames: [[Int16]] = []
+            while pending.count >= frameSampleCount {
+                frames.append(Array(pending.prefix(frameSampleCount)))
+                pending.removeFirst(frameSampleCount)
+            }
+            return frames
+        }
+        public var remainder: [Int16] { pending }
+    }
+}
+```
+
+- [ ] **Step 4: Run — expect pass** `[unit test]`
+
+Run: `swift test --filter PCMChunksTests 2>&1 | tail -3 && swift test --filter ClickyAudioTests 2>&1 | tail -3`
+Expected: `Executed 6 tests, with 0 failures`; then `Executed 7 tests, with 0 failures` (existing `AudioLevelTests` + 6 new).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add Sources/ClickyAudio/PCMChunks.swift Tests/ClickyAudioTests/PCMChunksTests.swift
+git commit -m "feat(audio): add PCM chunk helpers with unit tests"
+```
+
+---
+
+### Task 5.5.3: Live audio I/O — frozen interfaces (~35 min)
+
+**Files:** Create `Sources/ClickyAudio/MicrophoneCapture.swift` · `Sources/ClickyAudio/StreamingAudioPlayer.swift`. No unit tests (device-bound; `[manual OS check]` in Task 5.5.4). Complete bodies, no placeholders.
+
+- [ ] **Step 1: `MicrophoneCapture.swift`** `[integration]`
+
+```swift
+public final class MicrophoneCapture: @unchecked Sendable {
+    public enum CaptureError: Error, Equatable { case noInputDevice, converterUnavailable, engineStartFailed(String) }
+    public var onFrame: (@Sendable ([Int16]) -> Void)?   // tap thread; exact 320-sample (20 ms) frames
+    public var onError: (@Sendable (String) -> Void)?
+    public init()
+    public func start() throws
+    public func stop()
+}
+```
+Required mechanics (spec §4.1 ordering): `start()` is idempotent and lock-guarded (`NSLock` around `running` and one `PCMChunks.FrameFeeder`): take `engine.inputNode` → `try input.setVoiceProcessingEnabled(true)` **while the engine is stopped** → read `input.inputFormat(forBus: 0)` **after** enabling (0 rate/count → `.noInputDevice`) → build one long-lived `AVAudioConverter(from: hardwareFormat, to: AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true))` (nil → `.converterUnavailable`) → `installTap(onBus: 0, bufferSize: 1024, format: hardwareFormat)` → `engine.prepare()` → `try engine.start()` (failure removes the tap and throws `.engineStartFailed`). The tap body converts one buffer via a one-shot `converter.convert(to:error:)` (input block returns the buffer once with `.haveData`, then `.noDataNow`; output capacity `AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 16` with `ratio = 16_000 / buffer.format.sampleRate`), copies `output.int16ChannelData?[0]` (**guard it — never force-unwrap the audio path**) into `[Int16]`, feeds the feeder under the lock, and calls `onFrame` for each emitted frame outside the lock. `stop()` is idempotent: `removeTap`, `engine.stop()`, reset the feeder. No app/callback policy in this file.
+
+- [ ] **Step 2: `StreamingAudioPlayer.swift`** `[integration]`
+
+```swift
+@MainActor
+public final class StreamingAudioPlayer {
+    public enum PlayerError: Error, Equatable { case formatUnavailable }
+    public var onDrained: (() -> Void)?                 // last scheduled buffer finished
+    public var isPlaying: Bool                          // at least one scheduled buffer outstanding
+    public init() throws                                // .pcmFormatInt16, 24 kHz, mono, interleaved; attach + connect to mainMixerNode
+    public func start() throws                          // engine.start(); node.play()
+    public func enqueue(base64Chunks: [String])         // PCMChunks.samples(fromBase64Chunks:)
+    public func stopAll()                                // barge-in/stop: outstanding = 0; node.stop()
+    public func stop()                                  // stopAll() + engine.stop()
+}
+```
+`enqueue`: guard non-empty samples + `AVAudioPCMBuffer` + `int16ChannelData?[0]`; `frameLength = count`; copy with `samples.withUnsafeBufferPointer { channel.update(from: $0.baseAddress!, count: samples.count) }` (the base address is safe: non-empty, guarded); `if !node.isPlaying { node.play() }` (stopAll stopped the node); `outstanding += 1`; `node.scheduleBuffer(buffer) { Task { @MainActor in self?.bufferFinished() } }`. `bufferFinished()`: `outstanding = max(0, outstanding - 1)`; `if outstanding == 0 { onDrained?() }`. No echo logic here — the runner owns barge-in policy.
+
+- [ ] **Step 3: Build** `[integration]`
+
+Run: `swift build 2>&1 | tail -2` → `Build complete!`, no warnings. Device behavior is verified by Task 5.5.4's manual checks.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add Sources/ClickyAudio/MicrophoneCapture.swift Sources/ClickyAudio/StreamingAudioPlayer.swift
+git commit -m "feat(audio): add live microphone capture and streaming playback"
+```
+
+---
+
+### Task 5.5.4: Wave 1 — `LiveConversationRunner` (~75 min)
+
+**Files:** Create `Sources/ClickyApp/LiveConversationRunner.swift` · Modify `Sources/ClickyApp/AppDelegate.swift`.
+
+- [ ] **Step 1: Runner — frozen interface + exact wiring** `[manual OS check]`
+
+```swift
+import AppKit, ClickyAudio, ClickyCore, ClickyGemini, ClickyOverlay, Foundation
+
+@MainActor
+final class LiveConversationRunner {
+    let overlay = GhostCursorController()
+    // Private: client: GeminiLiveClient?, mic: MicrophoneCapture?, player: StreamingAudioPlayer?,
+    // hotKey: EscapeHotKey?, audioTask: Task<Void, Never>?, audioContinuation: AsyncStream<[Int16]>.Continuation?,
+    // cleanupTask: Task<Void, Never>?, running = false
+    static let systemInstruction: String   // the text below
+    static let tools: GeminiTool           // the declarations below (more added in W2)
+    var halfDuplex = false        // menu insurance; barge-in disabled by design in this mode — Esc still stops
+    func start() async
+    func stop(reason: StopReason) async    // idempotent; the first caller wins (Esc, menu, or failure)
+}
+```
+- **System instruction** (exact spirit; keep every rule): "You are Clicky, a live voice copilot inside a menu-bar app on this Mac. English only in this build. Speak like a quick, warm conversation partner: one or two short spoken sentences per reply, never a monologue. Actions available in this build: switch_app (open or switch to an app). Use a tool when the user asks for an action, and report the real outcome — the local computer confirms what happened, so never claim an action unless its tool result came back. If you cannot do something (other languages, screen reading, payments, files), say plainly that this build cannot do it yet. The user may interrupt you at any moment; that is expected — stop and listen."
+- **`switch_app` declaration** (exact): `GeminiFunctionDeclaration(name: "switch_app", description: "Open or switch to an application on this Mac. Use the app's common short name.", parameters: .object(["type": .string("object"), "properties": .object(["app": .object(["type": .string("string"), "description": .string("App name, for example Safari, Notes, Calculator")])]), "required": .array([.string("app")])]))`.
+- **`start()` in this exact order:** (1) `guard !running`; (2) read `ProcessInfo.processInfo.environment["GEMINI_API_KEY"]` — missing/empty → show overlay + status "GEMINI_API_KEY is not set — launch from a shell that sources ~/.clicky-gemini-key", return (never log/write the key); (3) `GeminiEndpoint.webSocketURL(apiKey:)` guard; (4) `try? StreamingAudioPlayer()` guard; (5) set `running`, show overlay, status "Connecting — live English slice"; (6) create mic; `player.onDrained = { [weak self] in self?.overlay.setStatus("Listening") }`; (7) an `AsyncStream<[Int16]>` (continuation stored) fed by `mic.onFrame = { continuation.yield($0) }`; one consumer `Task` loops `for await frame in frames` — `if halfDuplex && player.isPlaying { continue }` — `try? await client.sendAudioFrame(frame)` (**serially — the client's `EndOfSpeechDetector` must stay ordered; never spawn a task per frame**); (8) build `GeminiLiveClient(transportFactory: { URLSessionWebSocketTransport(url: url) }, setupFactory: { handle in GeminiSetupBuilder.make(systemInstruction: Self.systemInstruction, tools: Self.tools, resumptionHandle: handle) }, toolHandler: LiveToolHandler(overlay: overlay), onServerContent:/onNotice:/onMarker: hopping to `Task { @MainActor in … }`)`; (9) shared `EscapeHotKey { Task { @MainActor in await self?.stop(reason: .killSwitch) } }`, `install(GetApplicationEventTarget())`; (10) `try mic.start(); try player.start()` — failure → status pointing at System Settings › Privacy & Security › Microphone, then `stop(reason: .networkFailure)`; (11) `try await client.start()` → status "Live — say hello"; failure → status + `stop`.
+- **`stop(reason:)` exact order:** guard `running` → false; uninstall hotkey; `audioContinuation?.finish()`; cancel `audioTask`; `mic?.stop()`; `player?.stopAll()`; `await client.stop(reason:)`; nil out; `overlay.dismissConfirmation()`; green banner `STOPPED — local stop (no network)` for `.killSwitch` else `Session ended`; hide overlay after 4 s.
+- **Server content (barge-in):** `if content.interrupted == true { player?.stopAll(); overlay.setStatus("Interrupted — listening") }`; `if !content.audioBase64Chunks.isEmpty { player?.enqueue(base64Chunks: …); overlay.setStatus("Speaking") }`.
+- **Markers:** `.interruptedReceived` → `player?.stopAll()`; `.toolCallDropped` → "Action dropped — nothing ran"; others no-op (the chip lands in Task 5.5.8).
+
+- [ ] **Step 2: `LiveToolHandler` + `AppActivator`** `[manual OS check]`
+
+`private struct LiveToolHandler: GeminiToolHandling { let overlay: GhostCursorController }` — `execute` switches on `call.name` (`"switch_app"` → `switchApp`, default → error payload `{"status":"error","detail":…}` with `.interrupted`). `switchApp`: `case .string(let name)? = call.args?["app"]`; `await overlay.setIntent("Switch to \(name)")`; `let activated = await MainActor.run { AppActivator.resolveAndActivate(name: name) }`; nil → clear intent + error `no standard app named …`; else `await overlay.flashAction("Switched to \(activated)")` and return `.object(["status": .string("activated"), "app": .string(activated)])` with `.whenIdle`.
+
+`@MainActor private enum AppActivator` — Tier-2 rules, never destructive: normalize the spoken name lowercased; among `NSWorkspace.shared.runningApplications` with `activationPolicy == .regular`, pick the first by exact `localizedName` → `bundleIdentifier` suffix match → `localizedName` prefix; activate via `match.activate(from: .current, options: [.activateAllWindows])`. Otherwise scan **only** `/Applications`, `/System/Applications`, `~/Applications` for an entry equal to `"<name>.app"` (case-insensitive), `openApplication(at:configuration:)` (completion-handler variant); return the display name. Never open a path from speech, never outside those three folders.
+
+- [ ] **Step 3: `AppDelegate.swift` (exact additions)**
+
+Property after `demoRunner`: `private var liveRunner: LiveConversationRunner?`. Launch flag after the `--scripted-demo` block: `if CommandLine.arguments.contains("--live-demo") { Task { @MainActor [weak self] in try? await Task.sleep(for: .seconds(2)); self?.runLiveDemo() } }`. Actions after `stopScriptedDemo()`: `runLiveDemo()` (create-or-reuse runner; `Task { await runner.start() }`), `stopLiveDemo()` (`Task { await runner.stop(reason: .userToggle) }`), `toggleHalfDuplex()` (create-or-reuse; `runner.halfDuplex.toggle()`; `rebuildMenu()`). Menu items after the scripted-demo items in `rebuildMenu()`: "Start Live Conversation (English)", "Stop Live Demo (Esc)", "Half-duplex (mute mic while speaking): \(liveRunner?.halfDuplex == true ? "On" : "Off")" — all `target = self`.
+
+- [ ] **Step 4: Build + launch recipe** `[integration]`
+
+Run: `swift build -c release 2>&1 | tail -2 && ./scripts/make-app.sh 2>&1 | tail -2` → `Build complete!`; `Built and signed: build/Clicky.app`. Launch (key only inside the subshell, never echoed):
+```bash
+(set -a; source ~/.clicky-gemini-key; set +a; build/Clicky.app/Contents/MacOS/Clicky --live-demo)
+```
+
+- [ ] **Step 5: Wave-1 manual checks (the user performs)** `[manual OS check]`
+
+1. **Mic/TCC + usage string:** first launch asks for the microphone with `NSMicrophoneUsageDescription`; after granting, a spoken sentence gets an audible reply. If the mic is killed when exec'd this way: `open build/Clicky.app` once, grant Microphone, quit, re-run the sourced recipe (`open` cannot carry the key — LaunchServices starts a fresh environment; never place the key inside the app).
+2. **Echo ladder:** AEC is on by default (voice processing). If it hears itself (loops/self-interrupts), toggle Half-duplex → the loop stops. Otherwise headphones (ladder step 3, documented in the run sheet). Do not proceed with a live echo loop.
+3. **Barge-in:** talk over a reply → playback stops in the same second and it answers the new words.
+4. **Esc:** at any moment → green `STOPPED — local stop (no network)`, no further audio, mic released.
+5. **Conversation + Tier 2:** chat for two turns (it must not feel like a one-shot trigger) and "Open Safari" → Safari comes forward, narrated. Any failure → fix before committing.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add Sources/ClickyApp/LiveConversationRunner.swift Sources/ClickyApp/AppDelegate.swift
+git commit -m "feat(app): add live English conversation runner"
+```
+
+---
+
+### Task 5.5.5: Wave 2a — `type_text` with secure-input refusal (~30 min)
+
+**Files:** Modify `Sources/ClickyApp/LiveConversationRunner.swift`.
+
+- [ ] **Step 1: Imports/instruction/tools (exact)**
+
+Add `import Carbon.HIToolbox`, `import ClickyInput`, `import CoreGraphics`. Replace the instruction clause `switch_app (open or switch to an app).` with `switch_app (open or switch to an app), type_text (type text into the frontmost app after activating it).` Append to the declaration array: `GeminiFunctionDeclaration(name: "type_text", description: "Type text into the frontmost app using synthetic keystrokes. Refused while secure input is on.", parameters: .object(["type": .string("object"), "properties": .object(["text": .object(["type": .string("string"), "description": .string("The exact text to type")]), "app": .object(["type": .string("string"), "description": .string("Optional app to activate first")])]), "required": .array([.string("text")])]))`.
+
+- [ ] **Step 2: Handler (exact code)** `[manual OS check]`
+
+Add `case "type_text": return await Self.typeText(call, overlay: overlay)` to `execute`, then:
+
+```swift
+    private static func typeText(_ call: GeminiToolCall.FunctionCall,
+                                 overlay: GhostCursorController) async -> GeminiToolHandlerResult {
+        guard case .string(let text)? = call.args?["text"], !text.isEmpty else { return error(detail: "missing text") }
+        if case .string(let app)? = call.args?["app"], !app.isEmpty {
+            let activated = await MainActor.run { AppActivator.resolveAndActivate(name: app) }
+            guard activated != nil else { return error(detail: "no standard app named \(app)") }
+        }
+        guard !IsSecureEventInputEnabled() else {
+            await overlay.setIntent("Refused — secure input is on")
+            return GeminiToolHandlerResult(payload: .object(["status": .string("refused"),
+                                                              "detail": .string("secure input is enabled")]),
+                                           scheduling: .interrupted)
+        }
+        await overlay.setIntent("Typing \(text.count) characters")
+        let source = CGEventSource(stateID: .hidSystemState)
+        for chunk in UnicodeChunker.chunk(text) {           // ≤20 UTF-16 units, grapheme-safe
+            guard !IsSecureEventInputEnabled() else {
+                await overlay.setIntent(nil)
+                return error(detail: "secure input turned on mid-typing — stopped")
+            }
+            let units = Array(chunk.utf16)
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { continue }
+            down.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+            try? await Task.sleep(for: .milliseconds(12))
+        }
+        await overlay.setIntent(nil)
+        await overlay.flashAction("Typed \(text.count) characters")
+        return GeminiToolHandlerResult(payload: .object(["status": .string("typed")]), scheduling: .whenIdle)
+    }
+```
+
+Manual check (the user performs): build, relaunch via the sourced recipe, grant **Accessibility** to `build/Clicky.app` (required to post synthetic events). With Notes focused, "Type: hello Clicky, १२३ 123" → the text appears, graphemes intact. With a secure field focused (login/password prompt), the ask is refused and **nothing** is typed.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add Sources/ClickyApp/LiveConversationRunner.swift
+git commit -m "feat(app): add typed-text action with secure-input refusal"
+```
+
+---
+
+### Task 5.5.6: Wave 2b — confirm-gated real click on Clicky's own panel (~40 min)
+
+**Files:** Create `Sources/ClickyApp/DemoClickGate.swift` · Modify `Sources/ClickyApp/LiveConversationRunner.swift`.
+
+- [ ] **Step 1: `DemoClickGate.swift`** `[manual OS check]`
+
+```swift
+@MainActor
+final class DemoClickGate {
+    // NSWindow: titled, level .floating, isReleasedWhenClosed = false, centered, title
+    // "Clicky live-slice test target — this click is real"; holds NSButton "Demo target"
+    // (target = self, action = #selector(buttonFired), no keyEquivalent).
+    // Private: monitor: Any?, pending: CheckedContinuation<Bool, Never>?, buttonDidFire = false
+    func showPanel()                    // orderFrontRegardless() — visible, non-key
+    func hidePanel()
+    func beginGate()                    // NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil)
+    func buttonScreenCenter() -> CGPoint // button.convert(bounds, to: nil) → window.convertPoint(toScreen:)
+    func requestConfirmation(timeoutSeconds: Double = 20) async -> Bool
+    func performRealClick(at point: CGPoint) -> Bool  // posts; caller waits 200 ms then reads didFire
+    var didFire: Bool
+    func cancelPending()                // resolve(false) — session stop / safety
+}
+```
+- **Confirmation monitor (exact behavior):** `NSEvent.addLocalMonitorForEvents(matching: .keyDown)`; `kVK_Return` / `kVK_ANSI_KeypadEnter` → resolve `true`, return `nil` (swallow); `kVK_Escape` → resolve `false`, **return the event unchanged** (never swallow Esc — the Carbon hard stop must still fire; Esc is never repurposed); anything else → return the event. Resolve resumes the continuation once; remove the monitor after; a 20 s timer resolves `false`.
+- **`performRealClick`:** set `buttonDidFire = false`; `CGEventSource(stateID: .hidSystemState)`; build `.leftMouseDown`/`.leftMouseUp` with `mouseCursorPosition: point, mouseButton: .left`; post both to `.cghidEventTap`; return whether both events were created.
+- **Honesty:** the only target is our own panel; the flash must never claim a click that `didFire` did not confirm.
+
+- [ ] **Step 2: Wire the runner (exact)**
+
+Add `let gate = DemoClickGate()` after `let overlay = …`. In `start()`: `gate.showPanel()` after `overlay.showOverlay()`; pass `toolHandler: LiveToolHandler(overlay: overlay, gate: gate)`. In `stop()`: `gate.cancelPending()` and `gate.hidePanel()` after `player?.stopAll()`. Extend the instruction clause with `, click_demo_button (a real click on Clicky's own on-screen demo panel, after the user confirms it).` Append the third declaration: `GeminiFunctionDeclaration(name: "click_demo_button", description: "Click Clicky's own on-screen demo panel after the user confirms with the keyboard.", parameters: .object(["type": .string("object"), "properties": .object([:]), "required": .array([])]))`. Handler struct gains `let gate: DemoClickGate`; `execute` gains `case "click_demo_button": return await Self.clickDemoButton(overlay: overlay, gate: gate)`; add:
+
+```swift
+    private static func clickDemoButton(overlay: GhostCursorController,
+                                        gate: DemoClickGate) async -> GeminiToolHandlerResult {
+        await MainActor.run { gate.beginGate() }
+        let point = await MainActor.run { gate.buttonScreenCenter() }
+        await overlay.setIntent("Click: Clicky's own demo panel")
+        await overlay.moveCursor(to: point, duration: 0.8)
+        await overlay.showConfirmation("Press ⏎ to confirm — Esc stops the session")
+        let confirmed = await gate.requestConfirmation()
+        await overlay.dismissConfirmation()
+        guard confirmed else {
+            await overlay.setIntent(nil)
+            await overlay.flashAction("Click cancelled — nothing was clicked")
+            return GeminiToolHandlerResult(payload: .object(["status": .string("cancelled")]), scheduling: .interrupted)
+        }
+        _ = await MainActor.run { gate.performRealClick(at: point) }
+        try? await Task.sleep(for: .milliseconds(200))
+        let landed = await MainActor.run { gate.didFire }
+        await overlay.setIntent(nil)
+        await overlay.flashAction(landed ? "Real click landed on Clicky's own panel"
+                                         : "Click not confirmed — claiming nothing")
+        return GeminiToolHandlerResult(
+            payload: .object(["status": .string(landed ? "clicked" : "unconfirmed"),
+                              "target": .string("clicky_demo_panel")]),
+            scheduling: .whenIdle)
+    }
+```
+
+- [ ] **Step 3: Build + manual check (the user performs)** `[manual OS check]`
+
+"Click the demo button" → panel visible, ghost cursor glides, red gate + chip. **Return** → flash confirms the real click landed (button state). Repeat with **Esc** during the gate → "Click cancelled — nothing was clicked" **and** the hard stop fires (green banner).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add Sources/ClickyApp/DemoClickGate.swift Sources/ClickyApp/LiveConversationRunner.swift
+git commit -m "feat(app): add confirm-gated click on Clicky's own demo panel"
+```
+
+---
+
+### Task 5.5.7: Wave 2c — run sheet (~15 min)
+
+**Files:** Create `docs/demo/live-slice-run-sheet.md`.
+
+- [ ] **Step 1: Write the run sheet** `[manual OS check]`
+
+In order: (1) the sourced launch recipe + key hygiene (only from `~/.clicky-gemini-key` via subshell; never echo/commit/screenshot it); (2) the ~90 s beat sheet — hello/conversation → interrupt mid-reply → "Open Safari" → "Type: …" into Notes → "Click the demo button" + Return → Esc stop; (3) honest labels: **English only in this slice** · **Tier 1–2 real actions; Tier 3+ previews/gates only** · typing and the click ship before the Chunks 7–8 safety gates (the click targets only Clicky's own panel; typing refuses secure input and is demoed into a scratch note only) · the T3→T4 chip is one leg, not the meter (Chunk 14); (4) fallback ladder: AEC → half-duplex → headphones → scripted `--scripted-demo` → backup recording; (5) backup-recording procedure (QuickTime capture of one clean run; note the local path here; never commit the video) + hotspot note (a network drop fails closed to the scripted demo; no offline live claim).
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add docs/demo/live-slice-run-sheet.md
+git commit -m "docs: add live conversation slice run sheet"
+```
+
+---
+
+### Task 5.5.8: Wave 3 — voice-turn chip (T3→T4) (~20 min)
+
+**Files:** Modify `Sources/ClickyApp/LiveConversationRunner.swift`.
+
+- [ ] **Step 1: Add the instant + replace `handleMarker` (exact)** `[manual OS check]`
+
+Property after `running = false`: `private var lastAudioStreamEndAt: ContinuousClock.Instant?`. Replace `handleMarker(_:)` with:
+
+```swift
+    private func handleMarker(_ marker: GeminiMarker) {
+        switch marker {
+        case .audioStreamEndSent:
+            lastAudioStreamEndAt = .now
+        case .firstAudioFrameReceived:
+            if let start = lastAudioStreamEndAt {
+                let components = start.duration(to: .now).components
+                let seconds = Double(components.seconds) + Double(components.attoseconds) / 1e18
+                overlay.setStatus(Self.latencyChip(seconds: seconds))
+            }
+            lastAudioStreamEndAt = nil
+        case .interruptedReceived:
+            player?.stopAll()
+        case .toolCallDropped:
+            overlay.setStatus("Action dropped — nothing ran")
+        case .toolCallReceived, .toolResponseSent:
+            break
+        }
+    }
+
+    /// Measured T3 → T4 for the last voice turn — one leg only, labeled for what it
+    /// is (claims discipline: no end-to-end claim until Chunk 14's meter).
+    static func latencyChip(seconds: Double) -> String {
+        String(format: "last reply started in %.2f s — voice-turn leg only; full meter ships in Chunk 14 (not an end-to-end claim)", seconds)
+    }
+```
+Manual check: build, relaunch, speak a couple of turns — the pill shows `last reply started in X.XX s …` with a plausible, refreshing value; never present it as the product's end-to-end latency.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add Sources/ClickyApp/LiveConversationRunner.swift
+git commit -m "feat(app): add voice-turn latency chip to the live HUD"
+```
+
+---
+
+### Task 5.5.9: Chunk 5.5 Acceptance
+
+**Files:** none created (verification; the review loop may adjust code).
+
+- [ ] **Step 1: Clean build + full suite** `[unit test]`
+
+Run: `swift build -c release 2>&1 | tail -2 && swift test 2>&1 | tail -3`
+Expected: `Build complete!` (0 warnings); `Executed 63 tests, with 3 tests skipped and 0 failures` (57 baseline = 54 passed + 3 skipped, + 6 new = 60 passed + 3 skipped). Then `swift test --filter PCMChunksTests 2>&1 | tail -3` → `Executed 6 tests, with 0 failures`.
+
+- [ ] **Step 2: Scripted demo backup intact** `[manual OS check]`
+
+`swift run ClickyApp --scripted-demo` → the same beats as round 2; Esc stops with the banner.
+
+- [ ] **Step 3: Live slice run (the user performs)** `[manual OS check]`
+
+Launch via the run-sheet recipe; record: mic prompt/usage string · audible reply · AEC echo check + half-duplex fallback · barge-in stops in the same second · Esc banner · `switch_app` (Safari) · `type_text` into Notes (graphemes intact) · secure-input refusal · click gate (Return lands; Esc cancels + stops) · chip wording. Any unmet item: fix, or record it as a known limitation in the run sheet — never claim it works.
+
+- [ ] **Step 4: Hygiene** `[unit test]`
+
+```bash
+grep -rn "TODO\|FIXME" Sources Tests Package.swift; git grep -n "AIza"; git status --porcelain; git diff --stat chunk-5-gemini-resilience..HEAD
+```
+Expected: no TODO/FIXME; no key-shaped string; clean status; the diff touches only this section's files (plus the run sheet) — `Package.swift`, `README.md`, spec, and research untouched.
+
+- [ ] **Step 5: One combined spec+quality review (time-boxed, Chunk 4.5 precedent)**
+
+Dispatch **one** time-boxed combined spec+quality reviewer (`#max`, fresh context) over `git diff chunk-5-gemini-resilience..HEAD` — not two gates per task unless defects surface. Checks: exact scope; honest labels; no key material; barge-in + Esc wiring; every typed chunk through `UnicodeChunker`; secure-input refusal; the click targets only `DemoClickGate`; the chip's exact qualifier; no TODOs. Fix only build/behavior/scope/honesty defects, then commit `<type>(scope): address chunk 5.5 review findings`. **No tag, no README change, no GitHub release** for this insertion.
+
+- [ ] **Step 6: Definition of done**
+
+- [ ] `swift build -c release` clean · `swift test` = 63 (3 skipped, 0 failures) · `PCMChunksTests` = 6
+- [ ] W1: live conversation over the real API; barge-in stops playback in the same second; Esc stops locally with the green banner; `switch_app` activates a real app
+- [ ] Echo ladder exercised in order (AEC → half-duplex → headphones) and recorded in the run sheet
+- [ ] W2/W3 as built: typing grapheme-safe + secure-input refusal; Return-confirmed real click on our own panel only, Esc never repurposed; chip shows the T3→T4 leg with its qualifier
+- [ ] `--scripted-demo` backup intact · no tag · README untouched · no new dependencies · English-only scope honored
+- [ ] No unmeasured claim anywhere (the chip is a one-leg measurement; "same second" barge-in is a manual observation, not a metered number)
+
+**Scope-cut ladder if behind:** 1) drop the click gate (5.5.6); 2) drop `type_text` (5.5.5); 3) ship half-duplex instead of AEC tuning; 4) headphones guidance; 5) demo the scripted slice and describe the live slice as partially working — never claim what was not run.
+
+---
+
 ## Chunk 6: Accessibility engine — snapshots, matcher, crawler, hot cache, adapters (~3.5 hours)
 
 **Deliverable:** the local AX execution substrate: `ElementSnapshot`/`CacheKey` normalization (role + subrole + title + description) with secure-field detection (subrole-first, errata B1); role-aware `ElementMatcher` scoring (exact → fuzzy); a budgeted `AXTreeCrawler` (global 0.25 s messaging timeout via the system-wide element, depth ≤ 5 / ≤ 2000 nodes through `CrawlerBudget`, one batched attribute fetch per node); `AXHotCache` (per-app `AXObserver`, 100 ms debounce, speculative crawl on VAD onset/app activation, TOCTOU `revalidate(key:against:)`); `AXAppAdapters` (Electron `AXManualAccessibility` — Electron PR #10305 — and Chromium `AXEnhancedUserInterface`, 150 ms retry, attribute restore).
