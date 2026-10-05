@@ -41,6 +41,23 @@ final class LiveSpikeTests: XCTestCase {
             onMarker: { marker in if let markers { Task { await markers.record(marker) } } })
     }
 
+    /// Re-throws failures with only their URL-free `localizedDescription` visible:
+    /// XCTest prints a thrown error's full `userInfo`, and a bridged `URLError`
+    /// carries the key-bearing WebSocket URL in `NSErrorFailingURLStringKey`.
+    private struct RedactedSpikeError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private func redacted<T>(_ operation: () async throws -> T) async throws -> T {
+        do {
+            return try await operation()
+        } catch let skip as XCTSkip {
+            throw skip
+        } catch {
+            throw RedactedSpikeError(description: error.localizedDescription)
+        }
+    }
+
     func testSetupHandshakeAudioStreamEndAndSensitivitySpelling() async throws {
         let client = try makeClient()
         addTeardownBlock { await client.stop(reason: .userToggle) }
@@ -53,8 +70,8 @@ final class LiveSpikeTests: XCTestCase {
                 header, then re-run.
                 """)
         }
-        try await client.sendAudioFrame([Int16](repeating: 0, count: 320))
-        try await client.sendAudioStreamEnd()
+        try await redacted { try await client.sendAudioFrame([Int16](repeating: 0, count: 320)) }
+        try await redacted { try await client.sendAudioStreamEnd() }
         try await Task.sleep(nanoseconds: 5_000_000_000)
         let state = await client.connectionState
         XCTAssertEqual(state, .ready, "session left .ready within 5 s of audioStreamEnd")
@@ -64,8 +81,8 @@ final class LiveSpikeTests: XCTestCase {
     func testResumptionHandleArrives() async throws {
         let client = try makeClient()
         addTeardownBlock { await client.stop(reason: .userToggle) }
-        try await client.start()
-        try await client.sendTextTurn("Say ready.")   // induce generation; updates arrive sooner
+        try await redacted { try await client.start() }
+        try await redacted { try await client.sendTextTurn("Say ready.") }   // induce generation; updates arrive sooner
         var handle: String?
         for _ in 0..<20 {
             try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -80,10 +97,10 @@ final class LiveSpikeTests: XCTestCase {
         let markers = Recorder<GeminiMarker>()
         let client = try makeClient(handler: GatedToolHandler(), markers: markers)
         addTeardownBlock { await client.stop(reason: .userToggle) }
-        try await client.start()
+        try await redacted { try await client.start() }
         var observedToolCall = false
         for _ in 0..<3 {
-            try await client.sendTextTurn("ping")
+            try await redacted { try await client.sendTextTurn("ping") }
             let received = await markers.wait(matching: { if case .toolCallReceived = $0 { return true }; return false },
                                               timeout: 5)
             if received != nil { observedToolCall = true; break }
