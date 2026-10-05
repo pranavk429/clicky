@@ -4287,7 +4287,7 @@ Launch via the run-sheet recipe; record: mic prompt/usage string · audible repl
 - [ ] **Step 4: Hygiene** `[unit test]`
 
 ```bash
-grep -rn "TODO\|FIXME" Sources Tests Package.swift; git grep -n "AIza"; git status --porcelain; git diff --stat chunk-5-gemini-resilience..HEAD
+grep -rn "TODO\|FIXME" Sources Tests Package.swift; git grep -I -l -E 'AIza[0-9A-Za-z_-]{35}' 2>/dev/null; git status --porcelain; git diff --stat chunk-5-gemini-resilience..HEAD
 ```
 Expected: no TODO/FIXME; no key-shaped string; clean status; the diff touches only this section's files (plus the run sheet) — `Package.swift`, `README.md`, spec, and research untouched.
 
