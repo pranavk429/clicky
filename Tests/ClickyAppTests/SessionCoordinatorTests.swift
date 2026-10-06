@@ -156,6 +156,65 @@ actor OrderingAudio: AudioSessionPort {
     func stopPlaybackNow() async {}
 }
 
+/// Stop signal whose `start()` parks, so a test can stop the coordinator inside the
+/// early-registration window (after the client is built, before it connects).
+actor GatedStopSignal: StopSignalPort {
+    private let gate: AsyncGate
+    private(set) var starts = 0
+    private(set) var stops = 0
+
+    init(gate: AsyncGate) { self.gate = gate }
+
+    func start(onStop: @escaping @Sendable (StopReason) -> Void) async {
+        starts += 1
+        await gate.wait()   // reentrant: stopSignal.stop() still runs while parked here
+    }
+    func stop() async { stops += 1 }
+    func resetLatch() async {}
+    func triggerBargeIn(onset: ContinuousClock.Instant) async {}
+}
+
+/// Counts transport-factory invocations, i.e. whether the client attempted to connect.
+actor CallCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
+}
+
+/// Transport whose `close()` parks, so an older stop can be held mid-teardown while a
+/// newer start lands.
+actor BlockingCloseTransport: GeminiTransport {
+    private let gate: AsyncGate
+    private var deliveredSetup = false
+
+    init(gate: AsyncGate) { self.gate = gate }
+
+    func connect() async throws {}
+    func send(_ data: Data) async throws {}
+    func receive() async throws -> Data {
+        if !deliveredSetup {
+            deliveredSetup = true
+            return Data(#"{"setupComplete":{}}"#.utf8)
+        }
+        while !Task.isCancelled { try? await Task.sleep(nanoseconds: 5_000_000) }
+        throw GeminiTransportError.closed
+    }
+    func close() async { await gate.wait() }
+}
+
+/// Vends the blocking-close transport for the first start and a normal mock after.
+actor TransportVendor {
+    private let closeGate: AsyncGate
+    private(set) var calls = 0
+
+    init(closeGate: AsyncGate) { self.closeGate = closeGate }
+
+    func make() throws -> any GeminiTransport {
+        calls += 1
+        if calls == 1 { return BlockingCloseTransport(gate: closeGate) }
+        return try MockSession(scenarioJSON: noopScenarioJSON, sleeper: ImmediateSleeper())
+    }
+}
+
 @MainActor
 final class SessionCoordinatorTests: XCTestCase {
     func testMockDemoRoutesThroughRouterAndCancelsBeforeExecution() async throws {
@@ -359,5 +418,77 @@ final class SessionCoordinatorTests: XCTestCase {
         let json = try SessionCoordinator.demoCancelScenarioJSON()
         let scenario = try JSONDecoder().decode(MockSession.Scenario.self, from: Data(json.utf8))
         return scenario.frames.compactMap { GeminiServerMessage.decode(from: Data($0.json.utf8)) }
+    }
+
+    /// Issue 1: a stop that lands inside the early-registration window must stop the
+    /// stale start from connecting at all (no orphaned client with a live toolHandler).
+    func testStaleStartDoesNotConnectAfterStopDuringRegistration() async throws {
+        let gate = AsyncGate()
+        let stopSignal = GatedStopSignal(gate: gate)
+        let counter = CallCounter()
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: SpyAudio(), stopSignal: stopSignal,
+            transportFactory: {
+                await counter.increment()
+                return try MockSession(scenarioJSON: noopScenarioJSON, sleeper: ImmediateSleeper())
+            })
+
+        let startTask = Task { await coordinator.start() }
+        await gate.waitForWaiter()                 // start() parked in stopSignal.start()
+        await coordinator.stop(reason: .userToggle)
+        await gate.open()
+        await startTask.value
+
+        let factoryCalls = await counter.count
+        let starts = await stopSignal.starts
+        XCTAssertFalse(coordinator.isRunning)
+        XCTAssertNil(coordinator.client)
+        XCTAssertEqual(starts, 1, "the stop observer was registered before the client went live")
+        XCTAssertEqual(factoryCalls, 0, "a superseded start must not connect the client")
+    }
+
+    /// Issue 2: a new start that lands while an older stop is parked mid-teardown must
+    /// keep its client/router/observer; the older stop's trailing teardown must bail out.
+    func testOlderStopDoesNotClobberNewerSession() async throws {
+        let closeGate = AsyncGate()
+        let vendor = TransportVendor(closeGate: closeGate)
+        let audio = SpyAudio()
+        let stopSignal = TestStopSignal()
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: audio, stopSignal: stopSignal,
+            transportFactory: { try await vendor.make() })
+
+        await coordinator.start()
+        XCTAssertTrue(coordinator.isRunning)
+
+        let stopTask = Task { await coordinator.stop(reason: .userToggle) }
+        await closeGate.waitForWaiter()            // older stop parked in client.stop
+
+        // A new start lands while the older stop is still tearing down.
+        await coordinator.start()
+        XCTAssertTrue(coordinator.isRunning)
+        XCTAssertNotNil(coordinator.client, "the new session's client must not be clobbered")
+        XCTAssertNotNil(coordinator.router, "the new session's router must not be clobbered")
+
+        await closeGate.open()
+        await stopTask.value                       // older stop resumes; must not clobber
+
+        XCTAssertTrue(coordinator.isRunning, "the older stop must not stop the newer session")
+        XCTAssertNotNil(coordinator.client)
+        XCTAssertNotNil(coordinator.router)
+        let signalStops = await stopSignal.stops
+        XCTAssertEqual(signalStops, 0, "the older stop must not remove the newer session's observer")
+
+        // The newer session still stops cleanly.
+        await coordinator.stop(reason: .userToggle)
+        XCTAssertFalse(coordinator.isRunning)
+        let audioStops = await audio.stops
+        let signalStopsAfter = await stopSignal.stops
+        XCTAssertEqual(audioStops, 1, "the newer session tears audio down exactly once")
+        XCTAssertEqual(signalStopsAfter, 1)
     }
 }

@@ -52,8 +52,8 @@ final class SessionCoordinator {
     var onMarker: ((GeminiMarker) -> Void)?
     private(set) var isRunning = false
     private var startGeneration = 0
-    private var client: GeminiLiveClient?
-    private var router: ToolRouter?
+    private(set) var client: GeminiLiveClient?
+    private(set) var router: ToolRouter?
     private var modelTurnActive = false
     private var audioContinuation: AsyncStream<[Int16]>.Continuation?
     private var audioSendTask: Task<Void, Never>?
@@ -168,9 +168,14 @@ final class SessionCoordinator {
         // never be dropped just because audio/kill-switch start has not finished
         // (spec §4.4). The observer is torn down on any start failure below.
         await stopSignal.resetLatch()
+        guard isCurrent(generation) else { return }
         await stopSignal.start { [weak self] reason in
             Task { @MainActor in await self?.handleStopSignal(reason) }
         }
+        // A stop() that landed while registering above is authoritative: return before
+        // `live.start()`, which would otherwise reconnect an orphaned client whose
+        // toolHandler keeps executing with no reachable stop path.
+        guard isCurrent(generation) else { return }
         do {
             try await live.start()
         } catch {
@@ -220,15 +225,22 @@ final class SessionCoordinator {
     func stop(reason: StopReason) async {
         guard isRunning else { return }
         isRunning = false
+        let generation = startGeneration
         modelTurnActive = false
         audioContinuation?.finish()
         audioContinuation = nil
         audioSendTask?.cancel()
         audioSendTask = nil
-        await client?.stop(reason: reason)
+        // Detach this session's client/router synchronously and keep the reference, so
+        // an older stop that is still awaiting teardown can never clobber a newer
+        // start's state. The generation guards protect the remaining awaits.
+        let doomed = client
         client = nil
         router = nil
+        await doomed?.stop(reason: reason)
+        guard generation == startGeneration else { return }   // a newer start owns the state now
         await audio.stop()
+        guard generation == startGeneration else { return }
         await stopSignal.stop()
     }
 
