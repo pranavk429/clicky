@@ -53,6 +53,41 @@ final class EndOfSpeechDetectorTests: XCTestCase {
         XCTAssertTrue(detector.process(quiet))
     }
 
+    func testDefaultSilenceIsTheTunedLiveValue() {
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.defaultSilenceDurationMs, 500)
+        XCTAssertEqual(EndOfSpeechDetector.Configuration().silenceDurationMs, 500)
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(environment: [:]).silenceDurationMs, 500,
+                       "300 ms chopped natural multi-clause Hinglish pauses")
+    }
+
+    func testEnvironmentOverrideParsesAndTrims() {
+        let env = ["CLICKY_EOS_SILENCE_MS": "  700  "]
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(environment: env).silenceDurationMs, 700)
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(environment: env),
+                       EndOfSpeechDetector.Configuration(silenceDurationMs: 700),
+                       "only the silence duration follows the environment; other fields keep their defaults")
+    }
+
+    func testEnvironmentOverrideClampsToSupportedRange() {
+        let low = ["CLICKY_EOS_SILENCE_MS": "100"]
+        let high = ["CLICKY_EOS_SILENCE_MS": "5000"]
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(environment: low).silenceDurationMs, 250)
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(environment: high).silenceDurationMs, 900)
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(
+            environment: ["CLICKY_EOS_SILENCE_MS": "250"]).silenceDurationMs, 250)
+        XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(
+            environment: ["CLICKY_EOS_SILENCE_MS": "900"]).silenceDurationMs, 900)
+    }
+
+    func testMissingBlankAndGarbageEnvironmentValuesKeepDefault() {
+        let values: [String?] = [nil, "", "   ", "fast", "5.5"]
+        for value in values {
+            let env = value.map { ["CLICKY_EOS_SILENCE_MS": $0] } ?? [:]
+            XCTAssertEqual(EndOfSpeechDetector.Configuration.resolvedDefault(environment: env).silenceDurationMs, 500,
+                           "value \(String(describing: value)) must keep the 500 ms default")
+        }
+    }
+
     func testClientSendsAudioStreamEndExactlyOncePerBurst() async throws {
         let transport = FakeTransport(scriptedFrames: [WireFrames.setupComplete])
         let client = GeminiLiveClient(

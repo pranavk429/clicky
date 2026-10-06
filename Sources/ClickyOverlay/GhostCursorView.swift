@@ -48,6 +48,32 @@ struct OverlayVisualStyle: Equatable, Sendable {
     }
 }
 
+/// Pure activity → companion visual mapping. Like `OverlayVisualStyle`, the
+/// model never chooses color or motion — each visible activity has exactly one
+/// motion cue (Task T-OVERLAY).
+struct CompanionVisualStyle: Equatable, Sendable {
+    let tint: OverlayColor
+    let showsWaveform: Bool
+    let showsSpinner: Bool
+    let pulsesRing: Bool
+
+    var isVisible: Bool { tint.alpha > 0 }
+
+    static func style(for activity: CompanionActivity) -> CompanionVisualStyle {
+        switch activity {
+        case .hidden:
+            return CompanionVisualStyle(tint: OverlayColor(red: 0, green: 0, blue: 0, alpha: 0),
+                                        showsWaveform: false, showsSpinner: false, pulsesRing: false)
+        case .listening:
+            return CompanionVisualStyle(tint: .aiBlue, showsWaveform: true, showsSpinner: false, pulsesRing: false)
+        case .thinking:
+            return CompanionVisualStyle(tint: .reviewAmber, showsWaveform: false, showsSpinner: true, pulsesRing: false)
+        case .speaking:
+            return CompanionVisualStyle(tint: .stoppedGreen, showsWaveform: false, showsSpinner: false, pulsesRing: true)
+        }
+    }
+}
+
 /// Quadratic-Bézier pointer trajectory + cubic-Bézier (smoothstep) timing.
 enum PointerTrajectory {
     /// Cubic Bézier timing curve with control values (0, 0, 1, 1):
@@ -77,10 +103,38 @@ enum PointerTrajectory {
     }
 }
 
-/// Panel-local placement for the confirmation card and the stopped banner.
+/// Panel-local placement for the confirmation card, the stopped banner and the
+/// ambient cursor companion.
 enum OverlayLayout {
     static let cardSize = CGSize(width: 340, height: 104)
     static let margin: CGFloat = 12
+
+    /// The dedicated interactive card panel is the card plus a margin on every
+    /// side, so the card (and its soft edge) is never clipped by the window.
+    static let cardPanelSize = CGSize(width: cardSize.width + 2 * margin,
+                                      height: cardSize.height + 2 * margin)
+
+    /// Panel size for a measured card: the card plus a margin on every side,
+    /// never smaller than the nominal `cardPanelSize`. Long prompts grow the
+    /// panel instead of clipping; the card stays centered, so the placement
+    /// math (`cardCenter` → `OverlayGeometry.globalFrame`) is unchanged.
+    static func cardPanelSize(fittingCard size: CGSize) -> CGSize {
+        CGSize(width: max(cardPanelSize.width, size.width + 2 * margin),
+               height: max(cardPanelSize.height, size.height + 2 * margin))
+    }
+
+    /// Companion offset from the pointer tip (down-right in top-left
+    /// coordinates) so the buddy never covers the system pointer.
+    static let companionOffset = CGPoint(x: 22, y: 26)
+
+    /// Companion anchor: just off the pointer tip, clamped inside the panel so
+    /// it never leaves the screen.
+    static func companionCenter(near point: CGPoint, in size: CGSize) -> CGPoint {
+        let maxX = max(size.width - margin, margin)
+        let maxY = max(size.height - margin, margin)
+        return CGPoint(x: min(max(point.x + companionOffset.x, margin), maxX),
+                       y: min(max(point.y + companionOffset.y, margin), maxY))
+    }
 
     /// Card sits just below the target box, flips above when it would leave the
     /// panel, and clamps horizontally inside the panel.
@@ -104,14 +158,21 @@ enum OverlayLayout {
 @MainActor
 final class OverlayViewModel: ObservableObject {
     @Published var presentations: [UInt32: PanelPresentation] = [:]
+    /// Ambient companion state, driven by the session/model layer through
+    /// `.clickyModelActivityChanged` (or the session-state fallback).
+    @Published var companion: CompanionActivity = .hidden
+    /// Panel-local companion anchor per screen (the screen under the pointer).
+    @Published var companionPoints: [UInt32: CGPoint] = [:]
 }
 
 /// Panel content: renders the resolved presentation for one screen. Mouse
-/// events never reach it (the panel ignores them); the accessibility tree does.
+/// events never reach it (the full-screen panel ignores them); the
+/// accessibility tree does. The confirmation card lives in its own small
+/// interactive panel (`ConfirmationCardPanel`) so this glass wall stays 100%
+/// click-through.
 struct GhostCursorView: View {
     @ObservedObject var model: OverlayViewModel
     let screenID: UInt32
-    let onCardAction: (OverlayCardAction) -> Void
 
     @State private var travelFrom: CGPoint = .zero
     @State private var travelTo: CGPoint = .zero
@@ -129,6 +190,10 @@ struct GhostCursorView: View {
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
                 Color.clear
+                // Companion first: the ghost pointer/box always draw above it,
+                // so an active `.moving`/`.confirm` presentation is never
+                // obstructed by the buddy (Task T-OVERLAY placement choice).
+                companionLayer(in: proxy.size)
                 content(in: proxy.size)
             }
         }
@@ -178,6 +243,8 @@ struct GhostCursorView: View {
                         .accessibilityLabel(presentation.accessibilityText ?? "Reversible action target")
                 }
             case .confirm:
+                // Bounding box + resting pointer only — the interactive card
+                // is a separate small panel (OverlayWindowController.showCard).
                 if let rect = presentation.localRect {
                     BoundingBoxView(color: style.tint, lineWidth: style.boxLineWidth, pulses: style.pulses)
                         .frame(width: rect.width, height: rect.height)
@@ -187,18 +254,28 @@ struct GhostCursorView: View {
                     PointerGlyph(color: style.tint, opacity: style.restsOnTarget ? 0.85 : 1)
                         .position(point)
                 }
-                if let prompt = presentation.accessibilityText {
-                    ConfirmationCardView(prompt: prompt,
-                                         onConfirm: { onCardAction(.confirm) },
-                                         onCancel: { onCardAction(.cancel) })
-                        .position(OverlayLayout.cardCenter(near: presentation.localRect, in: size))
-                }
             case .stopped:
                 if style.showsBanner, let message = presentation.accessibilityText {
                     StoppedBannerView(message: message, tint: style.tint)
                         .position(OverlayLayout.bannerCenter(in: size))
                 }
             }
+        }
+    }
+
+    /// Ambient cursor buddy: follows the mouse with a spring while the model
+    /// activity is non-hidden. Rendered beneath `content(in:)` so it can never
+    /// obstruct the ghost pointer, and never hit-testable (the parent view
+    /// disables hit testing wholesale).
+    @ViewBuilder
+    private func companionLayer(in size: CGSize) -> some View {
+        if model.companion != .hidden, let point = model.companionPoints[screenID] {
+            CompanionView(activity: model.companion,
+                          tint: CompanionVisualStyle.style(for: model.companion).tint)
+                .position(OverlayLayout.companionCenter(near: point, in: size))
+                .animation(.spring(response: 0.35, dampingFraction: 0.75), value: point)
+                .animation(.spring(response: 0.35, dampingFraction: 0.75), value: model.companion)
+                .accessibilityHidden(true)   // decorative: never a VoiceOver stop
         }
     }
 }
@@ -239,6 +316,117 @@ struct PointerGlyph: View {
     }
 }
 
+/// Ambient cursor companion (Task T-OVERLAY): a small buddy that trails the
+/// pointer while the model is listening, thinking or speaking. Purely
+/// decorative — it never accepts mouse events (the parent view disables hit
+/// testing wholesale).
+struct CompanionView: View {
+    let activity: CompanionActivity
+    let tint: OverlayColor
+
+    var body: some View {
+        switch activity {
+        case .hidden:
+            EmptyView()
+        case .listening:
+            ListeningBuddyView(tint: tint)
+        case .thinking:
+            ThinkingBuddyView(tint: tint)
+        case .speaking:
+            SpeakingBuddyView(tint: tint)
+        }
+    }
+}
+
+/// Shared circular buddy body with a soft glow.
+private struct BuddyShell<Content: View>: View {
+    let tint: OverlayColor
+    let content: Content
+
+    init(tint: OverlayColor, @ViewBuilder content: () -> Content) {
+        self.tint = tint
+        self.content = content()
+    }
+
+    var body: some View {
+        ZStack {
+            Circle().fill(.black.opacity(0.78))
+            Circle().stroke(tint.swiftUIColor.opacity(0.9), lineWidth: 1.5)
+            content
+        }
+        .frame(width: 30, height: 30)
+        .shadow(color: tint.swiftUIColor.opacity(0.7), radius: 6)
+    }
+}
+
+/// `.listening`: glowing buddy with looping waveform bars.
+struct ListeningBuddyView: View {
+    let tint: OverlayColor
+
+    @State private var animating = false
+    private static let barHeights: [CGFloat] = [7, 13, 9, 15]
+
+    var body: some View {
+        BuddyShell(tint: tint) {
+            HStack(alignment: .center, spacing: 2.5) {
+                ForEach(0..<Self.barHeights.count, id: \.self) { index in
+                    Capsule()
+                        .fill(tint.swiftUIColor)
+                        .frame(width: 2.5, height: animating ? Self.barHeights[index] : 4)
+                        .animation(.easeInOut(duration: 0.45)
+                            .repeatForever(autoreverses: true)
+                            .delay(Double(index) * 0.09),
+                                   value: animating)
+                }
+            }
+        }
+        .onAppear { animating = true }
+    }
+}
+
+/// `.thinking`: buddy with a rotating arc while the model works.
+struct ThinkingBuddyView: View {
+    let tint: OverlayColor
+
+    @State private var spinning = false
+
+    var body: some View {
+        BuddyShell(tint: tint) {
+            Circle()
+                .trim(from: 0.05, to: 0.72)
+                .stroke(tint.swiftUIColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .frame(width: 16, height: 16)
+                .rotationEffect(.degrees(spinning ? 360 : 0))
+                .animation(.linear(duration: 1.1).repeatForever(autoreverses: false), value: spinning)
+        }
+        .onAppear { spinning = true }
+    }
+}
+
+/// `.speaking`: buddy with a gentle pulsing ring while model audio plays.
+struct SpeakingBuddyView: View {
+    let tint: OverlayColor
+
+    @State private var pulsing = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(tint.swiftUIColor.opacity(0.85), lineWidth: 2)
+                .frame(width: 30, height: 30)
+                .scaleEffect(pulsing ? 1.55 : 1)
+                .opacity(pulsing ? 0 : 0.9)
+                .animation(.easeOut(duration: 1.1).repeatForever(autoreverses: false), value: pulsing)
+            BuddyShell(tint: tint) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(tint.swiftUIColor)
+            }
+        }
+        .onAppear { pulsing = true }
+    }
+}
+
 /// Amber review box / pulsing red confirmation box.
 struct BoundingBoxView: View {
     let color: OverlayColor
@@ -265,8 +453,9 @@ struct BoundingBoxView: View {
 
 /// Accessible confirmation card (spec §4.3): VoiceOver reads the prompt; the
 /// Confirm/Cancel pills are individual accessibility elements so VoiceOver and
-/// switch control can reach and activate them. The panel is click-through, so
-/// the accessibility tree — not the pointer — is the non-voice input path.
+/// switch control can reach and activate them. Hosted by the dedicated small
+/// interactive panel (`ConfirmationCardPanel`), so the pills also respond to a
+/// single mouse click there while every full-screen panel stays click-through.
 struct ConfirmationCardView: View {
     let prompt: String
     let onConfirm: () -> Void
@@ -297,7 +486,8 @@ struct ConfirmationCardView: View {
     }
 }
 
-/// Mouse-inert pill; VoiceOver/switch activation presses it through AX.
+/// Pill button: pressed by mouse in the card panel, or by VoiceOver/switch
+/// activation through the accessibility tree.
 struct CardButton: View {
     let title: String
     let tint: OverlayColor

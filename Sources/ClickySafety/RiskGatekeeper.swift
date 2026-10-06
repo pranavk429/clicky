@@ -35,10 +35,15 @@ public struct RiskClassification: Equatable, Sendable {
         self.tier = tier; self.reasons = reasons; self.isEgress = isEgress
     }
 }
-/// The local 5-tier gatekeeper (spec §4.4; errata C5/C6). Egress actions (URL
-/// with parameters, navigation to a non-allowlisted domain, web-field typing,
-/// form submits, clipboard writes, outbound messages) are Tier 3+ because they
-/// cannot be un-sent.
+/// The local 5-tier gatekeeper (spec §4.4; errata C5/C6). Egress actions
+/// (navigation to a non-allowlisted domain, web-field typing, form submits,
+/// clipboard writes, outbound messages) are Tier 3+ because they cannot be
+/// un-sent. Allowlisted URLs with query parameters stay at their base Tier 2
+/// (user-approved deviation from errata C5, 2026-10-06) unless the path,
+/// query, or fragment carries a danger signal — a transactional/credential
+/// keyword or an embedded / redirect URL shape — in which case they escalate
+/// to Tier 3+ again. Plain search/watch URLs were escalating on every `?q=`
+/// and timing out at the spoken-confirmation gate.
 public enum RiskGatekeeper {
     public static func classify(_ context: RiskContext, modelRequestedTier: RiskTier? = nil) -> RiskClassification {
         if context.action == .read {
@@ -56,9 +61,24 @@ public enum RiskGatekeeper {
         switch context.action {
         case .openURL(let parameters):
             let allowlisted = context.url.map { NavigationPolicy.isAllowlisted($0) } ?? false
-            if parameters || !allowlisted {
+            if !allowlisted {
                 tier = max(tier, .irreversible)
-                reasons.append(parameters ? "egress:url-with-parameters" : "egress:unknown-domain"); egress = true
+                reasons.append("egress:unknown-domain"); egress = true
+            } else if let url = context.url, parameters || url.fragment != nil {
+                // The caller's `parameters` flag tracks the query only; a
+                // fragment-bearing URL is scanned too, because a fragment can
+                // carry the same danger shapes.
+                let danger = urlParameterDangerReasons(in: url)
+                if danger.isEmpty {
+                    // Deviation from errata C5 (user-approved, 2026-10-06):
+                    // allowlisted search/watch URLs are ordinary navigation, not
+                    // egress. Requiring spoken approval for every query parameter
+                    // forced a Tier 3 gate on "google search ..." and timed out.
+                    reasons.append("url:allowlisted-with-parameters")
+                } else {
+                    tier = max(tier, .irreversible)
+                    reasons.append(contentsOf: danger); egress = true
+                }
             }
         case .typeText where context.isWebField:
             tier = max(tier, .irreversible); reasons.append("egress:web-field-typing"); egress = true
@@ -84,6 +104,65 @@ public enum RiskGatekeeper {
         tier = max(tier, modelRequestedTier ?? tier)
         return RiskClassification(tier: tier, reasons: reasons, isEgress: egress)
     }
+    /// Danger signals scanned case-insensitively over an allowlisted URL's path,
+    /// query, and fragment. Any hit makes the navigation egress Tier 3+ again:
+    /// the transactional/credential keywords can drive a payment or secret
+    /// flow, and embedded `http`, `url=`, `redirect` and `%2f%2f` are the
+    /// open-redirect exfiltration shapes from errata C5. `URL.query` keeps its
+    /// percent escapes, so an encoded `%2f%2f` is visible here; raw and decoded
+    /// forms are scanned so encoded shapes (`%75rl=%68ttp...`, `%72edirect`)
+    /// cannot hide behind their escapes. Decoding is bounded to two passes so
+    /// double-encoded shapes (`%2575rl=%2568ttp`) cannot hide either, and a
+    /// malformed escape leaves the raw scan intact.
+    private static func urlParameterDangerReasons(in url: URL) -> [String] {
+        var scan = url.path
+        if let query = url.query { scan += "?" + query }
+        if let fragment = url.fragment { scan += "#" + fragment }
+        let decodedForms = decodedScanForms(of: scan)
+        // `+` is the form-encoded space; the space form lets phrase keywords
+        // match `q=pay+now` and `q=credit+card`.
+        var keywordText = scan
+        for form in decodedForms { keywordText += " " + form }
+        keywordText += " " + scan.replacingOccurrences(of: "+", with: " ")
+        var danger: [String] = []
+        if SafetyText.containsAny(urlScanFinancialKeywords, in: keywordText) {
+            danger.append("egress:url-danger:financial-keyword")
+        }
+        if SafetyText.containsAny(urlScanProhibitedKeywords, in: keywordText) {
+            danger.append("egress:url-danger:prohibited-keyword")
+        }
+        // Structural checks run on every raw/decoded form. The raw form keeps
+        // the literal `%2f%2f` check firing; the decoded forms catch encoded
+        // shapes.
+        let foldedForms = ([scan] + decodedForms).map(SafetyText.normalized)
+        if foldedForms.contains(where: { $0.contains("http") }) {
+            danger.append("egress:url-danger:embedded-url")
+        }
+        if foldedForms.contains(where: { $0.contains("url=") }) {
+            danger.append("egress:url-danger:url-parameter")
+        }
+        if foldedForms.contains(where: { $0.contains("redirect") }) {
+            danger.append("egress:url-danger:redirect")
+        }
+        if foldedForms.contains(where: { $0.contains("%2f%2f") }) {
+            danger.append("egress:url-danger:encoded-slash")
+        }
+        return danger
+    }
+    /// Percent-decodes up to `maxPasses` times, stopping when decoding fails
+    /// (malformed escape → nil) or the text stops changing. Two passes catch
+    /// double-encoded shapes (`%2575rl` → `%75rl` → `url`) without opening an
+    /// unbounded decode chain.
+    private static func decodedScanForms(of text: String, maxPasses: Int = 2) -> [String] {
+        var forms: [String] = []
+        var current = text
+        for _ in 0..<maxPasses {
+            guard let decoded = current.removingPercentEncoding, decoded != current else { break }
+            forms.append(decoded)
+            current = decoded
+        }
+        return forms
+    }
     private static func baseTier(_ action: RiskAction) -> RiskTier {
         switch action {
         case .read: return .read
@@ -103,13 +182,39 @@ public enum RiskGatekeeper {
         "recharge", "bill", "invoice",
         "भुगतान", "पेमेंट", "खरीद", "खरेदी", "बिल", "पैसे", "पैसा",
     ]
+    /// URL-scan keyword sets (2026-10-06 quality-review fix): the URL scan
+    /// flags transactional or credential intent only. Generic commerce
+    /// vocabulary ("buy", "bill", "pay", "purchase", "recharge", "invoice",
+    /// "transfer") and the bare "pin" made benign searches (`q=buy+iphone`,
+    /// `q=electricity+bill`, `q=pune+pin+code`) escalate to Tier 3 and expire
+    /// at the spoken-confirmation gate. Titles keep the broader lists above: a
+    /// "Pay Now" button is a payment control, while "buy iphone" is an
+    /// ordinary search.
+    static let urlScanFinancialKeywords = [
+        "payment", "pay now", "checkout", "upi", "netbanking", "net banking",
+        "credit card", "card number", "cvv",
+        "भुगतान", "पेमेंट", "पैसे", "पैसा",
+    ]
+    static let urlScanProhibitedKeywords = [
+        "password", "passwd", "passcode", "passphrase", "otp", "one-time password",
+        "sudo", "terminal", "keychain", "private key", "secret key",
+        "पासवर्ड", "ओटीपी", "पासकोड", "गुप्त कोड", "गुप्तशब्द",
+    ]
     static let prohibitedBundleIDs: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2", "com.apple.keychainaccess"]
     private static let financialActions: [RiskAction] = [.click, .submitForm, .financial]
 }
 /// URL allowlist for navigations (errata C5). A missing or non-allowlisted
 /// host escalates the navigation to Tier 3+ spoken approval in the gatekeeper.
 public enum NavigationPolicy {
-    public static let allowlistedDomains: Set<String> = ["wikipedia.org", "google.com", "duckduckgo.com", "agmarknet.gov.in"]
+    public static let allowlistedDomains: Set<String> = [
+        "wikipedia.org", "google.com", "duckduckgo.com", "agmarknet.gov.in",
+        "youtube.com", "github.com", "bing.com", "apple.com",
+        // Common everyday destinations (live-log fix, 2026-10-06): without these,
+        // "open LinkedIn" escalated to Tier 3 and expired at the confirmation gate.
+        "linkedin.com", "reddit.com", "x.com", "twitter.com", "instagram.com",
+        "facebook.com", "netflix.com", "amazon.com", "amazon.in",
+        "stackoverflow.com", "chatgpt.com", "perplexity.ai",
+    ]
     public static func isAllowlisted(_ url: URL, allowlist: Set<String> = allowlistedDomains) -> Bool {
         guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
         let bare = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host

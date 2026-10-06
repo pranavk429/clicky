@@ -14,27 +14,35 @@ public struct AudioInputChunk: Sendable {
     }
 }
 
-/// Output jitter buffer decision logic (Validation 01 §3.1): playback starts after
-/// `targetChunks` 20 ms slices; an underrun grows the target, a clean streak shrinks it.
-/// Pure logic, unit-tested; the engine owns the state.
+/// Output jitter buffer decision logic: playback starts after `targetSlices` ~85 ms
+/// playback slices; an underrun grows the target (85 → 170 → 255 ms), and a 20-slice
+/// clean streak shrinks it. This deliberately deviates from Validation 01 §3.1's
+/// 20 ms slices adapting 20→60 ms: measured on-device, 20 ms micro-slicing paid a
+/// per-slice allocation plus completion-callback churn that was audible as
+/// stutter/pops whenever the buffer drained. The slice cadence is also coarser than
+/// — and independent of — the 20 ms input wire cadence
+/// (`Configuration.wireChunkDurationMs`). Pure logic, unit-tested; the engine owns
+/// the state.
 public struct JitterBufferPolicy: Equatable, Sendable {
-    public static let chunkDurationMs = 20
-    public static let minChunks = 1
-    public static let maxChunks = 5
-    public static let cleanChunksToShrink = 100
-    public private(set) var targetChunks = 2
+    /// One playback slice: 85 ms (2040 samples @ 24 kHz). Batching playback at this size
+    /// avoids the per-20 ms allocation/callback churn that caused audible stutter.
+    public static let sliceDurationMs = 85
+    public static let minSlices = 1
+    public static let maxSlices = 3
+    public static let cleanSlicesToShrink = 20
+    public private(set) var targetSlices = 1
     public private(set) var underrunCount = 0
     private var cleanStreak = 0
     public init() {}
-    public var targetMillis: Int { targetChunks * Self.chunkDurationMs }
-    public func shouldStartPlayback(bufferedChunks: Int) -> Bool { bufferedChunks >= targetChunks }
+    public var targetMillis: Int { targetSlices * Self.sliceDurationMs }
+    public func shouldStartPlayback(bufferedSlices: Int) -> Bool { bufferedSlices >= targetSlices }
     public mutating func recordDelivery(hadUnderrun: Bool) {
         if hadUnderrun {
-            underrunCount += 1; cleanStreak = 0; targetChunks = min(targetChunks + 1, Self.maxChunks)
+            underrunCount += 1; cleanStreak = 0; targetSlices = min(targetSlices + 1, Self.maxSlices)
         } else {
             cleanStreak += 1
-            if cleanStreak >= Self.cleanChunksToShrink {
-                cleanStreak = 0; targetChunks = max(targetChunks - 1, Self.minChunks)
+            if cleanStreak >= Self.cleanSlicesToShrink {
+                cleanStreak = 0; targetSlices = max(targetSlices - 1, Self.minSlices)
             }
         }
     }
@@ -78,9 +86,10 @@ public enum AudioToneGenerator {
 
 /// The acoustic core (spec §4.1): VoiceProcessingIO enabled while the engine is STOPPED
 /// (errata B9/B10), a 1024-frame tap at the actual hardware rate, ONE long-lived
-/// AVAudioConverter to 16 kHz Int16, exact 20 ms chunks, an adaptive 2-chunk output jitter
-/// buffer, and the RMS mute gate during AEC convergence. Model audio (24 kHz PCM) plays
-/// through this same engine so AEC has its echo reference — never bypass VPIO.
+/// AVAudioConverter to 16 kHz Int16, exact 20 ms wire chunks, an adaptive output jitter
+/// buffer in ~85 ms playback slices (1–3 slices; 85–255 ms), and the RMS mute gate
+/// during AEC convergence. Model audio (24 kHz PCM) plays through this same engine so
+/// AEC has its echo reference — never bypass VPIO.
 public final class AudioStreamEngine: @unchecked Sendable {
     public struct Configuration: Sendable {
         // Requested 1024 frames; macOS delivers its own size — measured 4800-frame
@@ -88,6 +97,13 @@ public final class AudioStreamEngine: @unchecked Sendable {
         public var tapBufferSize: AVAudioFrameCount = 1024
         public var wireSampleRate: Double = 16_000
         public var wireChunkFrames: Int = 320                  // 20 ms
+        /// Exact input wire chunk cadence derived from `wireChunkFrames`/`wireSampleRate`
+        /// (320 frames @ 16 kHz = 20 ms; spec §4.1). Capture pacing uses this — never the
+        /// playback slice cadence.
+        public var wireChunkDurationMs: Int {
+            guard wireSampleRate > 0 else { return 0 }
+            return Int((Double(wireChunkFrames) / wireSampleRate * 1000).rounded())
+        }
         // Retained for plan-shape compatibility; the VPIO output anchor now uses the
         // input format's rate (macOS 27 requires matching client-side formats).
         public var outputSampleRate: Double = 48_000
@@ -323,12 +339,13 @@ public final class AudioStreamEngine: @unchecked Sendable {
     }
 
     private func drainWireChunks() {
+        guard configuration.wireChunkFrames > 0, configuration.wireChunkDurationMs > 0 else { return }
         while pending16k.count >= configuration.wireChunkFrames {
             guard let start = chunkStart else { break }
-            let slice = Array(pending16k.prefix(configuration.wireChunkFrames))
+            let chunk = Array(pending16k.prefix(configuration.wireChunkFrames))
             pending16k.removeFirst(configuration.wireChunkFrames)
-            chunkStart = start + .milliseconds(JitterBufferPolicy.chunkDurationMs)
-            processingQueue.async { [weak self] in self?.emit(slice, captureStart: start) }
+            chunkStart = start + .milliseconds(configuration.wireChunkDurationMs)
+            processingQueue.async { [weak self] in self?.emit(chunk, captureStart: start) }
         }
     }
 
@@ -380,7 +397,7 @@ public final class AudioStreamEngine: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Feed decoded 24 kHz PCM (one or more model audio chunks): sliced into 20 ms units,
+    /// Feed decoded 24 kHz PCM (one or more model audio chunks): sliced into ~85 ms units,
     /// converted to the engine's current playback format (the VPIO input rate), gated by
     /// the adaptive jitter buffer.
     public func enqueuePlaybackPCM(_ data: Data, sampleRate: Double = 24_000) {
@@ -388,16 +405,34 @@ public final class AudioStreamEngine: @unchecked Sendable {
         processingQueue.async { [weak self] in self?.handlePlayback(data, sampleRate: sampleRate) }
     }
 
+    /// Byte count of one `JitterBufferPolicy.sliceDurationMs` playback slice of 16-bit
+    /// mono PCM at `sampleRate` (4 080 bytes = 2 040 samples @ 24 kHz; 44.1 kHz rounds
+    /// 3748.5 → 3749 samples). Distinct from the 20 ms input wire cadence — capture
+    /// pacing must never use this.
+    static func playbackSliceBytes(sampleRate: Double) -> Int {
+        Int((sampleRate * Double(JitterBufferPolicy.sliceDurationMs) / 1000).rounded()) * 2
+    }
+
+    /// Splits decoded 16-bit PCM into whole playback slices and returns the sub-slice
+    /// remainder to carry into the next feed. Pure; unit-tested.
+    static func slicePlaybackPCM(_ data: Data, sampleRate: Double) -> (slices: [Data], remainder: Data) {
+        let sliceBytes = playbackSliceBytes(sampleRate: sampleRate)
+        guard sliceBytes > 0 else { return ([], data) }
+        var slices: [Data] = []
+        var remainder = data
+        while remainder.count >= sliceBytes {
+            slices.append(remainder.prefix(sliceBytes))
+            remainder.removeFirst(sliceBytes)
+        }
+        return (slices, remainder)
+    }
+
     private func handlePlayback(_ data: Data, sampleRate: Double) {
-        let sliceBytes = Int(sampleRate * Double(JitterBufferPolicy.chunkDurationMs) / 1000) * 2
         lock.lock()
         guard !playbackSuppressed else { lock.unlock(); return }
         playbackPartial.append(data)
-        var slices: [Data] = []
-        while playbackPartial.count >= sliceBytes {
-            slices.append(playbackPartial.prefix(sliceBytes))
-            playbackPartial.removeFirst(sliceBytes)
-        }
+        let (slices, remainder) = Self.slicePlaybackPCM(playbackPartial, sampleRate: sampleRate)
+        playbackPartial = remainder
         lock.unlock()
         for slice in slices { scheduleSlice(slice, sampleRate: sampleRate) }
     }
@@ -418,7 +453,7 @@ public final class AudioStreamEngine: @unchecked Sendable {
             schedule(buffer)
         } else {
             playbackBuffered.append(buffer)
-            guard jitter.shouldStartPlayback(bufferedChunks: playbackBuffered.count) else { return }
+            guard jitter.shouldStartPlayback(bufferedSlices: playbackBuffered.count) else { return }
             for buffered in playbackBuffered { schedule(buffered) }
             playbackBuffered.removeAll(keepingCapacity: true)
             playbackPrimed = true

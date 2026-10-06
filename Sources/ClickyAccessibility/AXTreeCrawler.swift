@@ -12,14 +12,17 @@ public struct AXNodeAttributes: Equatable, Sendable {
     public var title: String?
     public var description: String?
     public var placeholder: String?
+    public var value: String?
     public var frame: CGRect?
     public var isEnabled: Bool?
     public var actions: [String]
 
     public init(role: String? = nil, subrole: String? = nil, title: String? = nil, description: String? = nil,
-                placeholder: String? = nil, frame: CGRect? = nil, isEnabled: Bool? = nil, actions: [String] = []) {
+                placeholder: String? = nil, value: String? = nil, frame: CGRect? = nil,
+                isEnabled: Bool? = nil, actions: [String] = []) {
         self.role = role; self.subrole = subrole; self.title = title; self.description = description
-        self.placeholder = placeholder; self.frame = frame; self.isEnabled = isEnabled; self.actions = actions
+        self.placeholder = placeholder; self.value = value; self.frame = frame
+        self.isEnabled = isEnabled; self.actions = actions
     }
 }
 
@@ -35,14 +38,26 @@ public protocol AXNodeFactory: AnyObject {
     func node(for element: AXUIElement) -> any AXNode
 }
 
-/// Focused-window flattener (spec §4.2/§4.5): BFS, depth ≤ 5 / ≤ 2000 nodes via
-/// `CrawlerBudget`, one batched fetch per node. AX work stays on this actor, never `@MainActor`.
+/// Focused-window flattener (spec §4.2/§4.5): BFS, depth ≤ 12 / ≤ 2000 nodes via
+/// `CrawlerBudget` (depth raised from the spec's 5 — user-approved 2026-10-06 —
+/// so depth-7 `AXWebArea` content is reachable), one batched fetch per node. The
+/// first crawl of an Electron/Chromium pid arms the web-tree wake and may
+/// re-crawl once after a bounded probe (see `snapshot(focusedWindowOf:)`). AX
+/// work stays on this actor, never `@MainActor`.
 public actor AXTreeCrawler {
     public static let shared = AXTreeCrawler(source: RealAXNodeFactory())
     private let source: any AXNodeFactory
+    private let waker: any AXWebTreeWaking
+    private let wakeRegistry: AXWebTreeWakeRegistry
 
     public init(source: any AXNodeFactory) {
+        self.init(source: source, waker: SystemAXWebTreeWaker(), wakeRegistry: .shared)
+    }
+    /// Test seam (AGENTS.md §6): inject a fake waker and an isolated registry.
+    init(source: any AXNodeFactory, waker: any AXWebTreeWaking, wakeRegistry: AXWebTreeWakeRegistry) {
         self.source = source
+        self.waker = waker
+        self.wakeRegistry = wakeRegistry
     }
     /// Errata B2: set ONCE on the system-wide element ("globally for this process");
     /// per-element wrapping is NOT equivalent. `RealAXNodeFactory` calls this on init.
@@ -50,10 +65,26 @@ public actor AXTreeCrawler {
     public static func installGlobalMessagingTimeout() -> AXError {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), CrawlerBudget.interfaceTimeoutSeconds)
     }
-    /// Crawl the app's focused window (PID path). Empty on AX failure — callers fall back.
-    public func snapshot(focusedWindowOf pid: pid_t) -> [ElementSnapshot] {
+    /// Crawl the app's focused window (PID path). The first crawl of a
+    /// web-family app arms the web-tree wake (`AXManualAccessibility` /
+    /// `AXEnhancedUserInterface`); if that first flatten shows no `AXWebArea`,
+    /// one bounded wake probe runs and the crawl repeats once — the tree builds
+    /// asynchronously (~2.05–2.15 s measured for Electron), so the crawl is
+    /// never blocked for the build. Native apps take one memoized dictionary
+    /// read and nothing else. Empty on AX failure — callers fall back.
+    public func snapshot(focusedWindowOf pid: pid_t) async -> [ElementSnapshot] {
+        let wakeArmed = armWebTreeWakeIfNeeded(pid: pid)
         guard let root = source.focusedWindow(of: pid) else { return [] }
-        return flatten(root)
+        let first = flatten(root)
+        guard wakeArmed, !Self.exposesWebArea(first) else { return first }
+        // Only a positive probe (probe → wakeRetryDelayMilliseconds → probe)
+        // justifies the extra flatten: the probe searches the same depth range as
+        // `CrawlerBudget`, so a negative probe means a re-crawl cannot surface
+        // web content — the next natural crawl picks up the finished tree instead.
+        guard await waker.waitForTreeWake(pid: pid) else { return first }
+        guard let postWakeRoot = source.focusedWindow(of: pid) else { return first }
+        let second = flatten(postWakeRoot)
+        return second.isEmpty ? first : second   // keep the first flatten through a transient rebuild
     }
     /// Crawl a window element the caller already holds (app-activation path).
     public func snapshot(focusedWindow element: AXUIElement) -> [ElementSnapshot] {
@@ -81,18 +112,40 @@ public actor AXTreeCrawler {
         }
         return snapshots
     }
+    /// First-entry gate for the wake: family detection and the attribute set run
+    /// at most once per pid per app session (memoized in `wakeRegistry`). Returns
+    /// true only when this call armed the wake and the tree may still be building.
+    /// Synchronous AX IPC on the crawler's executor — never `@MainActor`. The real
+    /// AX path cannot be unit-tested; `AXWebTreeWakeTests` covers the policy with
+    /// fakes and carries the `[manual OS check]` steps for live apps.
+    private func armWebTreeWakeIfNeeded(pid: pid_t) -> Bool {
+        let waker = self.waker
+        let (family, firstEntry) = wakeRegistry.familyAndFirstEntry(pid: pid) { waker.detectFamily(of: $0) }
+        guard firstEntry, family != .native else { return false }
+        let restore = waker.enableWebTreeIfNeeded(pid: pid, family: family)
+        wakeRegistry.storeRestore(pid: pid, restore: restore)
+        return restore != nil
+    }
+    /// Web-content signal for the re-crawl gate: the same `AXWebArea` the wake
+    /// probe searches for, observed in an already-flattened crawl (roles are
+    /// normalized to lowercase by `CacheKey`).
+    private static func exposesWebArea(_ snapshots: [ElementSnapshot]) -> Bool {
+        snapshots.contains { $0.key.role == "axwebarea" }
+    }
     /// Pure projection (unit-tested via fakes); role-less nodes cannot be action targets, so they are dropped.
     static func makeSnapshot(attributes: AXNodeAttributes, element: AXUIElement) -> ElementSnapshot? {
         guard let role = attributes.role, !role.isEmpty else { return nil }
+        let isSecure = ElementSnapshot.looksSecure(role: role, subrole: attributes.subrole,
+                                                   title: attributes.title, placeholder: attributes.placeholder)
         return ElementSnapshot(
             element: element,
             key: CacheKey(role: role, subrole: attributes.subrole ?? "",
                           title: attributes.title ?? "", description: attributes.description ?? ""),
             frame: attributes.frame ?? .zero,
             isEnabled: attributes.isEnabled ?? true,
-            isSecureField: ElementSnapshot.looksSecure(role: role, subrole: attributes.subrole,
-                                                       title: attributes.title, placeholder: attributes.placeholder),
-            actions: attributes.actions)
+            isSecureField: isSecure,
+            actions: attributes.actions,
+            value: ElementSnapshot.storedValue(attributes.value ?? "", isSecure: isSecure))
     }
 }
 
@@ -112,7 +165,8 @@ public final class RealAXNode: AXNode {
     }
     public func attributes() -> AXNodeAttributes {
         let names = [kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXDescriptionAttribute,
-                     kAXPlaceholderValueAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXEnabledAttribute]
+                     kAXPlaceholderValueAttribute, kAXValueAttribute, kAXPositionAttribute,
+                     kAXSizeAttribute, kAXEnabledAttribute]
         let values = Self.copyMultiple(element, names)
         var actions: [String] = []
         var actionNames: CFArray?
@@ -125,6 +179,7 @@ public final class RealAXNode: AXNode {
             title: values[kAXTitleAttribute] as? String,
             description: values[kAXDescriptionAttribute] as? String,
             placeholder: values[kAXPlaceholderValueAttribute] as? String,
+            value: values[kAXValueAttribute] as? String,
             frame: Self.frame(position: values[kAXPositionAttribute], size: values[kAXSizeAttribute]),
             isEnabled: values[kAXEnabledAttribute] as? Bool,
             actions: actions)

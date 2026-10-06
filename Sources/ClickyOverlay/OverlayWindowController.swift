@@ -25,9 +25,10 @@ public enum OverlayCommand: Equatable, Sendable {
     }
 }
 
-/// Accessibility activation of the confirmation card (VoiceOver / switch
-/// control). The integration layer maps these onto the pending-action gate;
-/// nothing here executes hardware input by itself.
+/// Activation of the confirmation card — a mouse click in the card panel, or
+/// VoiceOver / switch-control activation through the accessibility tree. The
+/// integration layer maps these onto the pending-action gate; nothing here
+/// executes hardware input by itself.
 public enum OverlayCardAction: Equatable, Sendable {
     case confirm
     case cancel
@@ -109,8 +110,9 @@ enum OverlayPlacementResolver {
 /// One borderless panel per screen. The glass-wall invariant (spec §4.3;
 /// report 03 time-sink #5): `ignoresMouseEvents` is set ONCE here, in `init`,
 /// and no other line in this module may touch it — flipping it mid-run makes
-/// every click on the Mac land on the overlay. `canBecomeKey`/`canBecomeMain`
-/// are permanently false so the overlay never steals focus.
+/// every click on the Mac land on the overlay. The ONLY interactive overlay
+/// surface is the separate `ConfirmationCardPanel`. `canBecomeKey`/
+/// `canBecomeMain` are permanently false so the overlay never steals focus.
 final class OverlayPanel: NSPanel {
     init(screen: NSScreen) {
         super.init(contentRect: screen.frame,
@@ -134,6 +136,45 @@ final class OverlayPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Small interactive panel that hosts the confirmation card. This is the only
+/// Clicky overlay window that accepts mouse events; the full-screen
+/// `OverlayPanel`s stay a pure glass wall. It is `.nonactivatingPanel`, so
+/// clicking Confirm/Cancel never activates Clicky, and `becomesKeyOnlyIfNeeded`
+/// means key status is granted only when a control needs it (the buttons do
+/// not) — `showCard` never calls `makeKey`. Key status is allowed at all so
+/// button tracking works reliably; `CardHostingView.acceptsFirstMouse` lets the
+/// very first click land even while the panel is not key.
+final class ConfirmationCardPanel: NSPanel {
+    init(size: CGSize) {
+        super.init(contentRect: CGRect(origin: .zero, size: size),
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered,
+                   defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        level = .screenSaver
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        isMovable = false
+        isReleasedWhenClosed = false
+        animationBehavior = .none
+        sharingType = .none                // keeps legacy captures clean too
+        ignoresMouseEvents = false         // the one interactive overlay surface
+        becomesKeyOnlyIfNeeded = true
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Hosting view that accepts the first mouse click even when its panel is not
+/// key, so one click on Confirm/Cancel acts immediately instead of being
+/// consumed to make the window key.
+final class CardHostingView: NSHostingView<ConfirmationCardView> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 /// Owns the per-screen panels. Spec §4.3: `start()` pre-creates them at launch
 /// and rebuilds on display changes (lazy creation adds 50–200 ms and breaks the
 /// execution-leg budget); the first `present` is a documented safety net for a
@@ -142,8 +183,11 @@ final class OverlayPanel: NSPanel {
 public final class OverlayWindowController {
     public static let shared = OverlayWindowController()
 
-    /// CGWindowIDs of the live panels. The vision path reads this at capture
-    /// time and excludes the panels from ScreenCaptureKit (errata B11).
+    /// CGWindowIDs of EVERY live Clicky overlay window — the full-screen panels
+    /// plus the confirmation-card panel while it exists. The vision path reads
+    /// this at capture time and excludes these windows from ScreenCaptureKit
+    /// (errata B11). Refreshed whenever panels are created and whenever the
+    /// card panel is shown or dismissed.
     public private(set) var panelWindowIDs: [CGWindowID] = []
 
     /// Wired by the integration layer to the pending-action gate.
@@ -152,7 +196,26 @@ public final class OverlayWindowController {
     private let model = OverlayViewModel()
     private var panels: [PanelRecord] = []
     private var lastActiveScreenID: UInt32?
+    /// The last `.confirm` command, kept so a display change can re-resolve it
+    /// against the new geometry (the card must not vanish from a pending gate).
+    private var pendingConfirmation: OverlayCommand?
+    private var primaryHeight: CGFloat = 0
     private var screenObserver: NSObjectProtocol?
+    private var activityObserver: NSObjectProtocol?
+    private var sessionObserver: NSObjectProtocol?
+    private var cardPanel: ConfirmationCardPanel?
+    private var cardHostingView: CardHostingView?
+    private var companionTimer: Timer?
+    private var companionPolicy = CompanionTrackingPolicy()
+    /// Teardown guard: observer callbacks enqueue main-actor work that can run
+    /// after `stop()`. Deferred work checks this so it cannot resurrect panels
+    /// or restart the companion timer once torn down.
+    private var isStopped = false
+
+    /// Canonical constant for this notification currently lives in the app
+    /// target (`AppState`); `ClickyOverlay` depends only on `ClickyCore`, so it
+    /// observes the raw name — `NotificationCenter` matches by name value.
+    private static let sessionStateNotification = Notification.Name("clickySessionStateChanged")
 
     private struct PanelRecord {
         let geometry: DisplayGeometry
@@ -161,10 +224,12 @@ public final class OverlayWindowController {
 
     private init() {}
 
-    /// Creates/orders the panels and starts observing screen changes. Call once
-    /// at app launch (spec §4.3 pre-creation). Idempotent: the first `present`
-    /// also starts defensively when the integration missed this call.
+    /// Creates/orders the panels, starts observing screen changes, and wires
+    /// the ambient-companion activity signals. Call once at app launch
+    /// (spec §4.3 pre-creation). Idempotent: the first `present` also starts
+    /// defensively when the integration missed this call.
     public func start() {
+        isStopped = false
         guard panels.isEmpty else { return }
         rebuildPanels()
         if screenObserver == nil {
@@ -172,42 +237,110 @@ public final class OverlayWindowController {
                 forName: NSApplication.didChangeScreenParametersNotification,
                 object: nil, queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in self?.rebuildPanels() }
+                Task { @MainActor in
+                    guard let self, !self.isStopped else { return }
+                    self.rebuildPanels()
+                }
+            }
+        }
+        if activityObserver == nil {
+            activityObserver = NotificationCenter.default.addObserver(
+                forName: .clickyModelActivityChanged, object: nil, queue: .main
+            ) { [weak self] note in
+                let activity = Self.companionActivity(from: note.object)
+                Task { @MainActor in
+                    guard let self, !self.isStopped else { return }
+                    if let activity { self.setCompanionActivity(activity) }
+                }
+            }
+        }
+        if sessionObserver == nil {
+            sessionObserver = NotificationCenter.default.addObserver(
+                forName: Self.sessionStateNotification, object: nil, queue: .main
+            ) { [weak self] note in
+                let activity = Self.companionActivity(for: note.object as? SessionState)
+                Task { @MainActor in
+                    guard let self, !self.isStopped else { return }
+                    if let activity { self.setCompanionActivity(activity) }
+                }
             }
         }
     }
 
     public func stop() {
+        isStopped = true
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
             self.screenObserver = nil
         }
+        if let activityObserver {
+            NotificationCenter.default.removeObserver(activityObserver)
+            self.activityObserver = nil
+        }
+        if let sessionObserver {
+            NotificationCenter.default.removeObserver(sessionObserver)
+            self.sessionObserver = nil
+        }
+        dismissCard()
+        cardPanel = nil
+        cardHostingView = nil
+        stopCompanionTracking()
+        companionPolicy = CompanionTrackingPolicy()
+        model.companion = .hidden
+        model.companionPoints = [:]
         for record in panels { record.panel.orderOut(nil) }
         panels = []
         panelWindowIDs = []
         lastActiveScreenID = nil
+        pendingConfirmation = nil
         model.presentations = [:]
     }
 
     /// Interface contract for the integration chunks: present each state at a
     /// global CG point/rect; `.hidden` clears every panel. Starts the overlay
-    /// if `start()` was never called (no-op on the demo path).
+    /// if `start()` was never called (no-op on the demo path). `.confirm` also
+    /// shows the interactive card panel at the layout-computed position; every
+    /// other state dismisses it.
     public func present(_ command: OverlayCommand) {
         start()
+        if case .confirm = command {
+            pendingConfirmation = command
+        } else {
+            pendingConfirmation = nil
+        }
+        apply(command, announcePrompt: true)
+    }
+
+    /// Resolves `command` against the current panels, publishes the per-screen
+    /// presentations, and shows/dismisses the card panel accordingly. Also used
+    /// by `rebuildPanels` to re-resolve a pending confirmation after a display
+    /// change (without re-announcing it).
+    private func apply(_ command: OverlayCommand, announcePrompt: Bool) {
         let presentations = OverlayPlacementResolver.resolve(command,
                                                              screens: panels.map(\.geometry),
                                                              lastActiveScreenID: lastActiveScreenID)
         model.presentations = Dictionary(presentations.map { ($0.screenID, $0) },
                                          uniquingKeysWith: { _, latest in latest })
-        guard let first = presentations.first else { return }
+        guard let first = presentations.first else {
+            dismissCard()
+            return
+        }
         switch first.state {
         case .confirm:
-            announce(first.accessibilityText, onScreen: first.screenID)
+            if announcePrompt { announce(first.accessibilityText, onScreen: first.screenID) }
             lastActiveScreenID = first.screenID
+            if let prompt = first.accessibilityText,
+               let geometry = panels.first(where: { $0.geometry.id == first.screenID })?.geometry {
+                showCard(prompt: prompt, presentation: first, on: geometry)
+            } else {
+                dismissCard()
+            }
         case .stopped:
-            announce(first.accessibilityText, onScreen: first.screenID)
+            if announcePrompt { announce(first.accessibilityText, onScreen: first.screenID) }
+            dismissCard()
         case .moving, .review:
             lastActiveScreenID = first.screenID
+            dismissCard()
         }
     }
 
@@ -220,23 +353,155 @@ public final class OverlayWindowController {
     }
     public func presentStopped(reason: String) { present(.stopped(reason: reason)) }
 
+    /// Screen-parameter changes invalidate both the panel geometry and the
+    /// resolved presentations, so the card panel is dismissed with them and the
+    /// companion anchor is cleared (the next mouse tick republishes it). A
+    /// pending confirmation is re-resolved against the new geometry afterwards
+    /// so the card and its target box reappear correctly positioned; the gate
+    /// itself lives in the safety layer and is never touched here.
     private func rebuildPanels() {
+        dismissCard()
         for record in panels { record.panel.orderOut(nil) }
         model.presentations = [:]
+        model.companionPoints = [:]
         let primaryHeight = Self.primaryHeight()
+        self.primaryHeight = primaryHeight
         panels = NSScreen.screens.map { screen in
             let geometry = DisplayGeometry.from(screen: screen, primaryHeight: primaryHeight)
             let panel = OverlayPanel(screen: screen)
-            let hosting = NSHostingView(rootView: GhostCursorView(
-                model: model,
-                screenID: geometry.id,
-                onCardAction: { [weak self] action in self?.onCardAction?(action) }))
+            let hosting = NSHostingView(rootView: GhostCursorView(model: model, screenID: geometry.id))
             hosting.frame = CGRect(origin: .zero, size: screen.frame.size)
             panel.contentView = hosting
             panel.orderFrontRegardless()
             return PanelRecord(geometry: geometry, panel: panel)
         }
-        panelWindowIDs = panels.map { CGWindowID($0.panel.windowNumber) }
+        refreshPanelWindowIDs()
+        if let pendingConfirmation {
+            apply(pendingConfirmation, announcePrompt: false)
+        }
+    }
+
+    // MARK: - Interactive confirmation card
+
+    /// Shows the card panel centered exactly where the pure layout math
+    /// (`OverlayLayout.cardCenter`) places the card for this presentation, on
+    /// the screen that owns the confirm state. Called on every `.confirm` so a
+    /// retarget/prompt change recomputes the frame.
+    private func showCard(prompt: String, presentation: PanelPresentation, on screen: DisplayGeometry) {
+        let panel = cardPanel ?? makeCardPanel(prompt: prompt)
+        cardHostingView?.rootView = cardRootView(prompt: prompt)
+        // The hosting view centers the card; sizing the panel to the measured
+        // card + margin keeps long prompts unclipped while the card's center
+        // stays at the panel center (the placement math below relies on that).
+        let cardSize = cardHostingView?.fittingSize ?? OverlayLayout.cardSize
+        let panelSize = OverlayLayout.cardPanelSize(fittingCard: cardSize)
+        cardHostingView?.frame = CGRect(origin: .zero, size: panelSize)
+        let localCenter = OverlayLayout.cardCenter(near: presentation.localRect, in: screen.cgFrame.size)
+        let cgFrame = OverlayGeometry.globalFrame(centeredAtLocalPoint: localCenter,
+                                                  size: panelSize,
+                                                  onScreen: screen.cgFrame)
+        panel.setFrame(OverlayGeometry.appKitFrame(fromCGGlobal: cgFrame, primaryHeight: primaryHeight),
+                       display: true)
+        panel.orderFrontRegardless()
+        refreshPanelWindowIDs()
+    }
+
+    private func makeCardPanel(prompt: String) -> ConfirmationCardPanel {
+        let panel = ConfirmationCardPanel(size: OverlayLayout.cardPanelSize)
+        let hosting = CardHostingView(rootView: cardRootView(prompt: prompt))
+        hosting.frame = CGRect(origin: .zero, size: OverlayLayout.cardPanelSize)
+        panel.contentView = hosting
+        cardHostingView = hosting
+        cardPanel = panel
+        return panel
+    }
+
+    /// Root view whose buttons forward to the live `onCardAction` hook, so the
+    /// integration layer can rewire the gate at any time.
+    private func cardRootView(prompt: String) -> ConfirmationCardView {
+        ConfirmationCardView(prompt: prompt,
+                             onConfirm: { [weak self] in self?.onCardAction?(.confirm) },
+                             onCancel: { [weak self] in self?.onCardAction?(.cancel) })
+    }
+
+    /// Orders the card panel out (any non-confirm presentation, `stop()`). The
+    /// panel is kept for reuse until `stop()` releases it, and stays listed in
+    /// `panelWindowIDs` while it exists.
+    private func dismissCard() {
+        cardPanel?.orderOut(nil)
+        refreshPanelWindowIDs()
+    }
+
+    /// Rebuilds the capture-exclusion list: every full-screen panel plus the
+    /// card panel while its window exists (Task T-OVERLAY contract with the
+    /// vision path).
+    private func refreshPanelWindowIDs() {
+        var ids = panels.map { CGWindowID($0.panel.windowNumber) }
+        if let number = cardPanel?.windowNumber, number != 0 {
+            ids.append(CGWindowID(number))
+        }
+        panelWindowIDs = ids
+    }
+
+    // MARK: - Ambient cursor companion
+
+    /// Applies an activity from either notification contract and starts/stops
+    /// the ~30 Hz mouse-follow timer — the loop stops completely while hidden
+    /// (no idle wakeups).
+    private func setCompanionActivity(_ activity: CompanionActivity) {
+        let shouldTrack = companionPolicy.apply(activity)
+        model.companion = activity
+        if shouldTrack {
+            startCompanionTracking()
+        } else {
+            stopCompanionTracking()
+            model.companionPoints = [:]
+        }
+    }
+
+    private func startCompanionTracking() {
+        guard companionTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.publishCompanionPoint() }
+        }
+        companionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopCompanionTracking() {
+        companionTimer?.invalidate()
+        companionTimer = nil
+    }
+
+    /// One follow tick: read the AppKit mouse location, resolve the screen
+    /// under it, and publish that screen's panel-local anchor. A pointer that
+    /// is on no known display (reconfiguration gap) leaves the last anchor.
+    private func publishCompanionPoint() {
+        guard model.companion != .hidden else { return }
+        guard let resolved = CompanionTracking.localPoint(appKitMouseLocation: NSEvent.mouseLocation,
+                                                          primaryHeight: primaryHeight,
+                                                          screens: panels.map(\.geometry)) else { return }
+        model.companionPoints = [resolved.screenID: resolved.point]
+    }
+
+    /// Accepts both contract shapes for `.clickyModelActivityChanged`: a
+    /// `CompanionActivity` or its `rawValue` string.
+    nonisolated static func companionActivity(from object: Any?) -> CompanionActivity? {
+        if let activity = object as? CompanionActivity { return activity }
+        if let raw = object as? String { return CompanionActivity(rawValue: raw) }
+        return nil
+    }
+
+    /// Fallback mapping from the session lifecycle when no explicit model
+    /// activity has been posted: a live session at minimum shows the listening
+    /// buddy; idle/stopped hide it. `.reconnecting` leaves the current state
+    /// alone — the model-activity contract owns that transition.
+    nonisolated static func companionActivity(for state: SessionState?) -> CompanionActivity? {
+        switch state {
+        case .listening: return .listening
+        case .idle, .stopped: return .hidden
+        case .reconnecting, .none: return nil
+        }
     }
 
     /// VoiceOver announcement so the prompt reaches users even though the panel

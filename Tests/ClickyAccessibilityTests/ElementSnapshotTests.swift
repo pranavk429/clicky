@@ -11,9 +11,21 @@ final class ElementSnapshotTests: XCTestCase {
         XCTAssertEqual(key, CacheKey(role: "axbutton", subrole: "", title: "SAVE", description: "saves the document"))
         let snapshot = ElementSnapshot(element: AXUIElementCreateSystemWide(), key: key,
                                        frame: CGRect(x: 100, y: 60, width: 40, height: 20),
-                                       isEnabled: true, isSecureField: false, actions: ["AXPress"])
+                                       isEnabled: true, isSecureField: false, actions: ["AXPress"],
+                                       value: "clicky repo")
         XCTAssertEqual(snapshot.normalizedPoint, CGPoint(x: 120, y: 70))
         XCTAssertEqual(snapshot.actions, ["AXPress"])
+        XCTAssertEqual(snapshot.value, "clicky repo")
+        // Value is deliberately NOT part of CacheKey identity — it changes far
+        // more often than role/subrole/title/description.
+        XCTAssertEqual(key, CacheKey(role: "AXButton", subrole: "", title: "Save", description: "Saves the Document"))
+    }
+    func testStoredValueBoundsLengthAndRedactsSecureFields() {
+        XCTAssertEqual(ElementSnapshot.maxStoredValueLength, 500)
+        XCTAssertEqual(ElementSnapshot.storedValue("clicky repo", isSecure: false), "clicky repo")
+        XCTAssertEqual(ElementSnapshot.storedValue("hunter2", isSecure: true), "")
+        let long = String(repeating: "x", count: 700)
+        XCTAssertEqual(ElementSnapshot.storedValue(long, isSecure: false), String(long.prefix(500)))
     }
     func testSecureFieldDetection() {
         // Errata B1: AXSecureTextField is a SUBROLE — the role is usually AXTextField.

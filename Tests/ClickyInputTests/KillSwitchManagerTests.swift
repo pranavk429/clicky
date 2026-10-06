@@ -58,4 +58,54 @@ final class KillSwitchManagerTests: XCTestCase {
         XCTAssertTrue(manager.triggerKillSwitch(source: .hotKey))
         XCTAssertNil(manager.lastBargeInMilliseconds, "hotkey path has no onset anchor")
     }
+    func testKillSwitchAfterBargeInStillRunsFullStopSequence() {
+        let recorder = Recorder()
+        let manager = makeManager(recorder)
+        XCTAssertTrue(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertTrue(manager.triggerKillSwitch(source: .hotKey),
+                      "emergency stop must not be masked by a barge-in that already latched")
+        XCTAssertEqual(recorder.snapshot(),
+                       ["stopPlayback(interrupted=true)",
+                        "stopPlayback(interrupted=true)",
+                        "releaseInput",
+                        "banner(Clicky stopped (⌘⇧X))",
+                        "stopSession"])
+        XCTAssertEqual(manager.lastTriggerSource, .hotKey)
+        XCTAssertTrue(manager.isInterrupted)
+    }
+    func testKillSwitchIsOneShotPerTurn() {
+        let recorder = Recorder()
+        let manager = makeManager(recorder)
+        XCTAssertTrue(manager.triggerKillSwitch(source: .hotKey))
+        XCTAssertFalse(manager.triggerKillSwitch(source: .menuBar))
+        XCTAssertEqual(recorder.snapshot().count, 4)
+        XCTAssertEqual(manager.lastTriggerSource, .hotKey)
+    }
+    func testBargeInAfterKillSwitchReturnsFalse() {
+        let recorder = Recorder()
+        let manager = makeManager(recorder)
+        XCTAssertTrue(manager.triggerKillSwitch(source: .hotKey))
+        XCTAssertFalse(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertEqual(recorder.snapshot().count, 4)
+    }
+    func testBargeInIsOneShotPerTurn() {
+        let recorder = Recorder()
+        let manager = makeManager(recorder)
+        XCTAssertTrue(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertFalse(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertEqual(recorder.snapshot().count, 1)
+    }
+    func testResetRearmsBothPaths() {
+        let recorder = Recorder()
+        let manager = makeManager(recorder)
+        XCTAssertTrue(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertTrue(manager.triggerKillSwitch(source: .hotKey))
+        manager.reset()
+        XCTAssertFalse(manager.isInterrupted)
+        XCTAssertTrue(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertTrue(manager.triggerKillSwitch(source: .menuBar))
+        XCTAssertFalse(manager.triggerBargeIn(source: .voiceOnset))
+        XCTAssertFalse(manager.triggerKillSwitch(source: .hotKey))
+        XCTAssertEqual(manager.lastTriggerSource, .menuBar)
+    }
 }

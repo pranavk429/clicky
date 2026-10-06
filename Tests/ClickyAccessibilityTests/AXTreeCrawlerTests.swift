@@ -34,16 +34,16 @@ final class AXTreeCrawlerTests: XCTestCase {
         XCTAssertEqual(AXTreeCrawler.installGlobalMessagingTimeout(), .success)
     }
     func testFlattenEnforcesBudgetCaps() async {
-        var chain = FakeAXNode(AXNodeAttributes(role: "AXStaticText", title: "d8"))
-        for depth in stride(from: 7, through: 0, by: -1) {
+        var chain = FakeAXNode(AXNodeAttributes(role: "AXStaticText", title: "d13"))
+        for depth in stride(from: 12, through: 0, by: -1) {
             chain = FakeAXNode(AXNodeAttributes(role: depth == 0 ? "AXWindow" : "AXGroup", title: "d\(depth)"),
                                children: [chain])
         }
         let depthFactory = FakeAXNodeFactory()
         depthFactory.focusedWindowNode = chain
         let chainElements = await AXTreeCrawler(source: depthFactory).snapshot(focusedWindowOf: 42)
-        XCTAssertEqual(chainElements.count, 6)                    // depths 0...5
-        XCTAssertEqual(chainElements.last?.key.title, "d5")
+        XCTAssertEqual(chainElements.count, 13)                   // depths 0...12
+        XCTAssertEqual(chainElements.last?.key.title, "d12")
 
         let wideFactory = FakeAXNodeFactory()
         wideFactory.focusedWindowNode = FakeAXNode(
@@ -51,6 +51,36 @@ final class AXTreeCrawlerTests: XCTestCase {
             children: (0..<2_500).map { FakeAXNode(AXNodeAttributes(role: "AXStaticText", title: "row \($0)")) })
         let wideElements = await AXTreeCrawler(source: wideFactory).snapshot(focusedWindowOf: 42)
         XCTAssertEqual(wideElements.count, CrawlerBudget.maxNodes)     // 2000
+    }
+    func testFlattenDiscoversWebAreaBelowTheOldDepthFiveCap() async {
+        // Regression (user-approved fix, 2026-10-06): Chromium/Electron place
+        // AXWebArea at depth 7 (VS Code 1.140.0 / Antigravity IDE, measured), so
+        // the old depth-5 cap discovered zero web content.
+        var chain = FakeAXNode(AXNodeAttributes(role: "AXStaticText", title: "page content"))
+        for depth in stride(from: 12, through: 0, by: -1) {
+            chain = FakeAXNode(AXNodeAttributes(role: depth == 0 ? "AXWindow" : depth == 7 ? "AXWebArea" : "AXGroup",
+                                                title: "d\(depth)"), children: [chain])
+        }
+        let factory = FakeAXNodeFactory()
+        factory.focusedWindowNode = chain
+        let elements = await AXTreeCrawler(source: factory).snapshot(focusedWindowOf: 42)
+        XCTAssertEqual(elements.count, CrawlerBudget.maxDepth + 1)     // depths 0...12
+        XCTAssertTrue(elements.contains { $0.key.role == "axwebarea" && $0.key.title == "d7" })
+    }
+    func testSnapshotsCarryValuesAndRedactSecureFields() async {
+        let factory = FakeAXNodeFactory()
+        factory.focusedWindowNode = FakeAXNode(AXNodeAttributes(role: "AXWindow", title: "Browser"), children: [
+            FakeAXNode(AXNodeAttributes(role: "AXTextField", title: "Search", value: "clicky repo")),
+            FakeAXNode(AXNodeAttributes(role: "AXTextField", subrole: "AXSecureTextField",
+                                        title: "Password", value: "hunter2")),
+            FakeAXNode(AXNodeAttributes(role: "AXTextField", title: "Notes",
+                                        value: String(repeating: "x", count: 700))),
+        ])
+        let elements = await AXTreeCrawler(source: factory).snapshot(focusedWindowOf: 42)
+        XCTAssertEqual(elements.first { $0.key.title == "search" }?.value, "clicky repo")
+        XCTAssertEqual(elements.first { $0.isSecureField }?.value, "")     // errata B1: never cached
+        XCTAssertEqual(elements.first { $0.key.title == "notes" }?.value.count,
+                       ElementSnapshot.maxStoredValueLength)
     }
     func testSnapshotsCarryFramesActionsAndSecureFlagsAndDropRolelessNodes() async {
         let factory = FakeAXNodeFactory()

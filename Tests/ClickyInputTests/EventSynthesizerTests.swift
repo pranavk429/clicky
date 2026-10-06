@@ -71,4 +71,44 @@ final class EventSynthesizerTests: XCTestCase {
         XCTAssertEqual(outcome, .unverified(reason: "no focused element to verify against"))
         XCTAssertTrue(poster.unicodeChunks.isEmpty)
     }
+
+    // MARK: Key chords
+
+    func testPressKeyCmdTPostsAnsiTWithCommandFlag() async {
+        let poster = RecordingEventPoster()
+        let pressed = await makeTestSynthesizer(poster: poster, elements: FakeElementServices())
+            .pressKey("cmd+t", on: makeSentinelElement())
+        XCTAssertTrue(pressed)
+        XCTAssertEqual(poster.chords.count, 1)
+        XCTAssertEqual(poster.chords.first?.keyCode, 17)   // ANSI 't'
+        XCTAssertEqual(poster.chords.first?.flags, .maskCommand)
+    }
+
+    func testPressKeyCmdShiftTPostsAnsiTWithCommandAndShiftFlags() async {
+        let poster = RecordingEventPoster()
+        let pressed = await makeTestSynthesizer(poster: poster, elements: FakeElementServices())
+            .pressKey("cmd+shift+t", on: makeSentinelElement())
+        XCTAssertTrue(pressed)
+        XCTAssertEqual(poster.chords.count, 1)
+        XCTAssertEqual(poster.chords.first?.keyCode, 17)   // ANSI 't'
+        XCTAssertEqual(poster.chords.first?.flags, [.maskCommand, .maskShift])
+    }
+
+    func testPressKeyPlainReturnStillPostsReturnKeyCode() async {
+        let poster = RecordingEventPoster()
+        let pressed = await makeTestSynthesizer(poster: poster, elements: FakeElementServices())
+            .pressKey("return", on: makeSentinelElement())
+        XCTAssertTrue(pressed)
+        XCTAssertEqual(poster.chords.count, 1)
+        XCTAssertEqual(poster.chords.first?.keyCode, 36)
+        XCTAssertEqual(poster.chords.first?.flags, CGEventFlags())
+    }
+
+    func testPressKeyUnknownKeyReturnsFalseWithoutPosting() async {
+        let poster = RecordingEventPoster()
+        let pressed = await makeTestSynthesizer(poster: poster, elements: FakeElementServices())
+            .pressKey("cmd+unknownkey", on: makeSentinelElement())
+        XCTAssertFalse(pressed)
+        XCTAssertTrue(poster.chords.isEmpty)
+    }
 }

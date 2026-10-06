@@ -13,7 +13,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var killSwitch: KillSwitchManager?
     private var audioSelfTest: AudioSelfTestRunner?
     private var demoRunner: ScriptedDemoRunner?
-    private var liveRunner: LiveConversationRunner?
+    private var wakeWord: WakeWordListener?
+    private static let wakeWordEnabledKey = "clicky.wakeWordEnabled"
+    /// Voice-activation preference, default ON. Read via `object(forKey:)` first:
+    /// an absent key must mean "enabled", while `bool(forKey:)` alone would
+    /// report the default as off.
+    private var wakeWordEnabled: Bool {
+        get {
+            UserDefaults.standard.object(forKey: Self.wakeWordEnabledKey) == nil
+                ? true
+                : UserDefaults.standard.bool(forKey: Self.wakeWordEnabledKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.wakeWordEnabledKey) }
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.toolTip = "Clicky — voice cursor"
@@ -26,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // latches on the first trigger, so without this reset the second
                 // kill-switch press never fires (spec §4.4 one-trigger-per-turn latch).
                 if state == .listening { self?.killSwitch?.reset() }
+                self?.syncWakeWordState(state)
                 self?.rebuildMenu()
             }
         }
@@ -42,7 +55,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--live-demo") {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(2))
-                self?.runLiveDemo()
+                // Same path as the menu toggle; only start when idle/stopped so a
+                // session already active at launch is never toggled off.
+                guard let self, !self.state.session.isActive else { return }
+                self.state.toggleSession()
             }
         }
         installHotKeys()
@@ -51,9 +67,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.setNotice(text) }
         }
         SessionCoordinator.shared.observeAppState()
+        if wakeWordEnabled { startWakeWordListener(announceIfUnsupported: true) }
     }
     @objc private func toggleSession() { state.toggleSession() }
+
+    /// Voice activation: saying "Clicky" starts a session hands-free. The
+    /// preference persists in UserDefaults; the listener runs on-device only.
+    @objc private func toggleWakeWord() {
+        wakeWordEnabled.toggle()
+        if wakeWordEnabled {
+            startWakeWordListener(announceIfUnsupported: true)
+        } else {
+            stopWakeWordListener()
+        }
+        rebuildMenu()
+    }
+
+    /// Start the on-device wake-word listener unless one is already running.
+    /// Permission/availability failures surface as menu notices instead of
+    /// silently leaving the preference on with nothing listening.
+    private func startWakeWordListener(announceIfUnsupported: Bool = false) {
+        guard wakeWord == nil else { return }
+        guard WakeWordListener.isSupported else {
+            if announceIfUnsupported { setNotice("Wake word is not supported on this Mac") }
+            return
+        }
+        if !WakeWordListener.hasSpeechPermission {
+            // First run: macOS only shows the Speech Recognition prompt from the
+            // request call — ask, then retry once the user answers. A previously
+            // denied state returns false immediately (no prompt).
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if await WakeWordListener.requestSpeechPermission() {
+                    self.startWakeWordListener(announceIfUnsupported: announceIfUnsupported)
+                } else {
+                    self.setNotice("Wake word needs Speech Recognition permission — System Settings → Privacy & Security → Speech Recognition")
+                }
+            }
+            return
+        }
+        let listener = WakeWordListener()
+        listener.onWake = {
+            Task { @MainActor in
+                // Start only when no session is active (idle/stopped); an active
+                // session owns the mic and the toggle would stop it.
+                if !AppState.shared.session.isActive { AppState.shared.toggleSession() }
+            }
+        }
+        do {
+            try listener.start()
+        } catch {
+            setNotice("Wake word unavailable (\(error)) — enable Speech Recognition in System Settings")
+            return
+        }
+        wakeWord = listener
+        // Enabled mid-session: the listener must not fight the session for the
+        // mic, so start it (establishing the engine) then park it immediately.
+        if state.session.isActive { listener.pause() }
+    }
+
+    private func stopWakeWordListener() {
+        wakeWord?.stop()
+        wakeWord = nil
+    }
+
+    /// Keep the wake-word listener on the opposite side of the mic from the
+    /// session: paused while Clicky is listening/reconnecting, resumed once the
+    /// session is idle or stopped. No-op while the preference is off.
+    private func syncWakeWordState(_ state: SessionState?) {
+        guard let state, wakeWordEnabled else { return }
+        switch state {
+        case .listening, .reconnecting: wakeWord?.pause()
+        case .idle, .stopped: wakeWord?.resume()
+        }
+    }
+    /// The text-command fallback (voice-first, not voice-only): opens the typed
+    /// command panel, or points at the session toggle when there is no session
+    /// to receive the text.
+    @objc private func showTextCommand() {
+        guard state.session.isActive else {
+            setNotice("Start listening first (⌘⇧Space) — then type your command")
+            return
+        }
+        TextCommandPanelController.shared.show { text in
+            Task { @MainActor in await SessionCoordinator.shared.submitTypedCommand(text) }
+        }
+    }
     func applicationWillTerminate(_ notification: Notification) {
+        wakeWord?.stop()
         Task { await SessionCoordinator.shared.stop(reason: .userToggle) }
     }
     @objc private func showPermissions() { PermissionsWindowController.shared.show() }
@@ -66,22 +167,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let runner = demoRunner {
             Task { await runner.stop(reason: .userToggle) }
         }
-    }
-    @objc private func runLiveDemo() {
-        let runner = liveRunner ?? LiveConversationRunner()
-        liveRunner = runner
-        Task { await runner.start() }
-    }
-    @objc private func stopLiveDemo() {
-        if let runner = liveRunner {
-            Task { await runner.stop(reason: .userToggle) }
-        }
-    }
-    @objc private func toggleHalfDuplex() {
-        let runner = liveRunner ?? LiveConversationRunner()
-        liveRunner = runner
-        runner.halfDuplex.toggle()
-        rebuildMenu()
     }
     func setNotice(_ text: String?) { notice = text; rebuildMenu() }
     private func rebuildMenu() {
@@ -101,6 +186,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 action: #selector(toggleSession), keyEquivalent: "")
         toggle.target = self
         menu.addItem(toggle)
+        let wakeWordItem = NSMenuItem(title: "Wake Word (\"Clicky\"): \(wakeWordEnabled ? "On" : "Off")",
+                                      action: #selector(toggleWakeWord), keyEquivalent: "")
+        wakeWordItem.target = self
+        menu.addItem(wakeWordItem)
+        let typeCommand = NSMenuItem(title: "Type a Command…", action: #selector(showTextCommand), keyEquivalent: "")
+        typeCommand.target = self
+        menu.addItem(typeCommand)
         menu.addItem(.separator())
         let selfTest = NSMenuItem(title: "Run Audio Self-Test (30 s)…", action: #selector(runAudioSelfTest), keyEquivalent: "")
         selfTest.target = self
@@ -115,16 +207,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stopDemo = NSMenuItem(title: "Stop Demo (Esc)", action: #selector(stopScriptedDemo), keyEquivalent: "")
         stopDemo.target = self
         menu.addItem(stopDemo)
-        let runLive = NSMenuItem(title: "Start Live Conversation (English)", action: #selector(runLiveDemo), keyEquivalent: "")
-        runLive.target = self
-        menu.addItem(runLive)
-        let stopLive = NSMenuItem(title: "Stop Live Demo (Esc)", action: #selector(stopLiveDemo), keyEquivalent: "")
-        stopLive.target = self
-        menu.addItem(stopLive)
-        let halfDuplex = NSMenuItem(title: "Half-duplex (mute mic while speaking): \(liveRunner?.halfDuplex == true ? "On" : "Off")",
-                                    action: #selector(toggleHalfDuplex), keyEquivalent: "")
-        halfDuplex.target = self
-        menu.addItem(halfDuplex)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Clicky", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
@@ -150,10 +232,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stopPlayback: { [weak self] in self?.audioSelfTest?.stopPlaybackNow() },
             releaseSyntheticInput: { KillSwitchManager.releaseSyntheticInputNow() },
             presentBanner: { [weak self] text in Task { @MainActor in self?.setNotice(text) } },
-            // Stop whichever demo/session path is running. Must not write `notice` — that
-            // would overwrite the kill-switch banner presented above.
+            // Stop the scripted demo path; the live session's own kill-switch observer
+            // stops it via the notification posted after these hooks. Must not write
+            // `notice` — that would overwrite the kill-switch banner presented above.
             stopSession: { [weak self] in Task { @MainActor in
-                self?.stopLiveDemo()
                 self?.stopScriptedDemo()
             } }))
         self.killSwitch = killSwitch

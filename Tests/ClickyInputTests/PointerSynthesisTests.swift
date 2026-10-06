@@ -30,6 +30,37 @@ final class PointerSynthesisTests: XCTestCase {
         XCTAssertEqual(poster.mouseEvents.map { $0.type }, [.mouseMoved, .leftMouseDown, .leftMouseUp])
     }
 
+    func testClickHoldsBetweenDownAndUpForAtLeast30Milliseconds() async {
+        let poster = RecordingEventPoster(), elements = FakeElementServices()
+        let synthesizer = makeTestSynthesizer(poster: poster, elements: elements, pacing: .default)
+        _ = await synthesizer.click(at: CGPoint(x: 120, y: 240))
+        XCTAssertEqual(poster.mouseEvents.map { $0.type }, [.mouseMoved, .leftMouseDown, .leftMouseUp])
+        guard let down = poster.mouseEvents.first(where: { $0.type == .leftMouseDown }),
+              let up = poster.mouseEvents.first(where: { $0.type == .leftMouseUp }) else {
+            return XCTFail("down and up expected")
+        }
+        let gap = up.timestamp.timeIntervalSince(down.timestamp)
+        XCTAssertGreaterThanOrEqual(gap, 0.030,
+                                    "WebKit/Chrome/AppKit drop clicks whose down/up share a timestamp")
+        XCTAssertLessThan(gap, 1.0, "the hold stays imperceptible")
+    }
+
+    func testCancelledClickStillPostsMouseUp() async throws {
+        let poster = RecordingEventPoster(), elements = FakeElementServices()
+        let pacing = SynthesisPacing(clickHold: .seconds(5))
+        let synthesizer = makeTestSynthesizer(poster: poster, elements: elements, pacing: pacing)
+        let clickTask = Task { await synthesizer.click(at: CGPoint(x: 7, y: 8)) }
+        var spins = 0
+        while !poster.mouseEvents.contains(where: { $0.type == .leftMouseDown }) && spins < 1000 {
+            try await Task.sleep(for: .milliseconds(2)); spins += 1
+        }
+        XCTAssertTrue(poster.mouseEvents.contains(where: { $0.type == .leftMouseDown }))
+        clickTask.cancel()   // kill switch / barge-in mid-hold
+        _ = await clickTask.value
+        XCTAssertEqual(poster.mouseEvents.map { $0.type }, [.mouseMoved, .leftMouseDown, .leftMouseUp],
+                       "the mouse-up is posted even when the click task is cancelled mid-hold")
+    }
+
     func testMoveMouseScrollAndPressKey() async {
         let poster = RecordingEventPoster(), synth = makeTestSynthesizer(poster: poster, elements: FakeElementServices())
         await synth.moveMouse(to: CGPoint(x: 7, y: 8))
@@ -39,6 +70,14 @@ final class PointerSynthesisTests: XCTestCase {
         XCTAssertTrue(scrolled); XCTAssertEqual(poster.scrollEvents.count, 1)
         let pressed = await synth.pressKey("return", on: makeSentinelElement())
         XCTAssertTrue(pressed); XCTAssertEqual(poster.chords.count, 1)
+    }
+
+    func testScrollMagnitudeUnits() async {
+        let poster = RecordingEventPoster(), synth = makeTestSynthesizer(poster: poster, elements: FakeElementServices())
+        _ = await synth.scroll("down 2", on: makeSentinelElement())
+        XCTAssertEqual(poster.scrollEvents.last?.delta, -30)
+        _ = await synth.scroll("up", on: makeSentinelElement())
+        XCTAssertEqual(poster.scrollEvents.last?.delta, 15)
     }
 
     func testDragPostsInterpolatedEvents() async {

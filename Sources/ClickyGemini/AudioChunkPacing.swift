@@ -5,7 +5,6 @@ import Foundation
 public enum AudioChunkPacing {
     public static let wireInputSampleRate = 16_000
     public static let wireOutputSampleRate = 24_000
-    public static let chunkDurationMs = 20
     public static let exhaustiveChunkCeilingMs = 100
     public static let audioMimeType = "audio/pcm;rate=16000"
     public static let videoMimeType = "image/jpeg"

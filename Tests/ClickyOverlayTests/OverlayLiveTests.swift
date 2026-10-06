@@ -54,7 +54,20 @@ final class OverlayLiveTests: XCTestCase {
         controller.present(.confirm(rect: CGRect(x: primary.midX - 120, y: primary.midY + 60, width: 240, height: 120),
                                     point: CGPoint(x: primary.midX, y: primary.midY + 120),
                                     prompt: "Delete note 'Project'. Say Haan to confirm, or Ruko to cancel."))
-        pause(12)   // VoiceOver / Accessibility Inspector checks run in this window
+        XCTAssertEqual(controller.panelWindowIDs.count, NSScreen.screens.count + 1,
+                       "the interactive card panel must join the capture-exclusion list")
+        pause(12)   // VoiceOver / Accessibility Inspector + card-click checks run in this window
+        // [manual OS check] companion: each activity must show its buddy near
+        // the pointer (waveform / spinner / pulsing ring); while hidden it
+        // disappears; the full-screen panels stay click-through throughout.
+        NotificationCenter.default.post(name: .clickyModelActivityChanged, object: CompanionActivity.listening)
+        pause(4)
+        NotificationCenter.default.post(name: .clickyModelActivityChanged, object: "thinking")
+        pause(4)
+        NotificationCenter.default.post(name: .clickyModelActivityChanged, object: CompanionActivity.speaking)
+        pause(4)
+        NotificationCenter.default.post(name: .clickyModelActivityChanged, object: CompanionActivity.hidden)
+        pause(1)
         controller.present(.stopped(reason: "kill switch"))
         pause(5)
         controller.present(.hidden)

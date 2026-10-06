@@ -1,24 +1,20 @@
 # Clicky — live English conversation slice run sheet
 
-> **Honest label, say it in the first sentence:**
-> **"live conversation slice — English; Tier 1–2 real actions; Tier 3+ previews/gates only."**
+> **Status (2026-10-06): the Chunk 5.5 "live English slice" prototype is retired.** `--live-demo`
+> no longer launches it — the flag now starts the full `SessionCoordinator` session 2 seconds
+> after launch, the same path as the menu-bar **Start Listening** toggle, through the real
+> `GeminiLiveClient`, overlay, Chunks 7–8 safety gates, and Esc hard local stop. Mock mode
+> remains `CLICKY_MOCK=1` (transport swap only: every scripted tool call still flows through
+> the real AX/CGEvent path). The scripted Chunk 4.5 demo (`--scripted-demo`) keeps working as
+> the emergency backup.
 >
-> This slice is a deliberately narrow, honest cut of the real product: full-duplex live
-> conversation through the real `GeminiLiveClient`, instant barge-in playback stop, and the
-> Esc hard local stop. **English only in this slice** (no Hindi/Marathi tuning). It carries
-> **no chunk tag**, no architecture/safety/scope changes, and is absorbed or retired later by
-> Chunks 9–13. The scripted Chunk 4.5 demo (`--scripted-demo`) keeps working as the emergency
-> backup.
->
-> **Labels that apply to every run:**
-> - **English only in this slice.**
-> - **Tier 1–2 real actions; Tier 3+ previews/gates only.**
-> - Typing and the click ship **before the Chunks 7–8 safety gates** — the click targets
->   **only Clicky's own demo panel**, and typing **refuses secure input** and is demoed into a
->   **scratch note only**.
-> - The T3→T4 chip is **one leg, not the meter** (the full meter ships in Chunk 14).
-> - **No performance number below is measured.** "Stops in the same second" for barge-in is a
->   **manual observation**, never a metered number, and the chip is never an end-to-end claim.
+> **Prototype-specific details below are historical:** the English-only label described the
+> prototype's tuning (the full session mirrors English, Hindi, or Marathi), the click beat's
+> demo panel (`DemoClickGate`) is gone, and the typing/click labels predate the Chunks 7–8
+> gates that now precede execution. The conversation, Safari, typing, and Esc beats still run
+> against the real session; the honesty rules still apply — **no performance number below is
+> measured**, and "stops in the same second" for barge-in is a **manual observation**, never a
+> metered number.
 
 ---
 
@@ -31,7 +27,13 @@ Build the signed app once, then launch it through the sourced recipe:
 
 # Key is sourced ONLY inside the subshell — never echoed, never logged, never committed,
 # never screenshotted. The app reads GEMINI_API_KEY from its environment.
+# `--live-demo` now starts the full SessionCoordinator session 2 s after launch (the same
+# path as the menu-bar "Start Listening" toggle); the Chunk 5.5 prototype is retired.
 (set -a; source ~/.clicky-gemini-key; set +a; build/Clicky.app/Contents/MacOS/Clicky --live-demo)
+
+# Mock mode (offline / key failure): swaps ONLY the transport — every scripted tool call
+# still flows through the real AX/CGEvent path.
+CLICKY_MOCK=1 build/Clicky.app/Contents/MacOS/Clicky
 ```
 
 **Key hygiene (non-negotiable):**

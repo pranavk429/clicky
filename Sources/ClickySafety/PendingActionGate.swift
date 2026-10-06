@@ -26,6 +26,11 @@ public actor PendingActionGate {
         case cancelled(PendingAction, CancelReason)
     }
     public enum SpeechOutcome: Equatable, Sendable { case ignored(String), cancelled(CancelReason), accepted }
+    /// Outcome of an on-screen card button decision (direct, non-voice input).
+    public enum DirectDecision: Equatable, Sendable { case accepted, latched, ignored(String) }
+    /// Which local input channel latched an early affirmative, so the adapter
+    /// can label the confirmation source correctly (voice vs on-screen tap).
+    public enum EarlyLatchSource: Equatable, Sendable { case voice, direct }
     public enum ArmOutcome: Equatable, Sendable { case execute(PendingAction), abort(CancelReason) }
     public enum Tick: Equatable, Sendable {
         case idle
@@ -42,6 +47,15 @@ public actor PendingActionGate {
     private var speechPausedAt: Date?
     private var promptCompletedAt: Date?
     private var warnedSoon = false
+    /// Latched early affirmative captured while the model was still speaking the
+    /// prompt. `promptTurnComplete()` consumes it (fresh latch → arm), and
+    /// present/negation/timeout clear it. Financial actions never latch: the
+    /// amount read-back cannot have been heard before the prompt completes.
+    private var earlyAffirmativeAt: Date?
+    /// Which local channel produced the latch above; nil whenever there is no
+    /// latch. Mirrors the latch lifecycle so the adapter can label the
+    /// confirmation source correctly.
+    public private(set) var earlyLatchSource: EarlyLatchSource?
     private static func clampTimeout(_ seconds: TimeInterval) -> TimeInterval {
         min(max(seconds, minimumTimeout), maximumTimeout)
     }
@@ -60,16 +74,27 @@ public actor PendingActionGate {
         default:
             break
         }
-        speechPausedAt = nil; promptCompletedAt = nil; warnedSoon = false
+        speechPausedAt = nil; promptCompletedAt = nil; warnedSoon = false; clearEarlyLatch()
         state = .awaitingTurnComplete(action)
     }
     /// The model finished speaking the confirmation prompt; the timeout timer
-    /// starts now — never earlier.
-    public func promptTurnComplete() {
-        guard case .awaitingTurnComplete(let action) = state else { return }
+    /// starts now — never earlier. Returns true when a fresh early affirmative
+    /// was latched: the action arms immediately at completion time (the caller
+    /// still runs `awaitArmAndRevalidate`, the only execution path). A stale
+    /// latch (older than the action timeout) is dropped.
+    @discardableResult
+    public func promptTurnComplete() -> Bool {
+        guard case .awaitingTurnComplete(let action) = state else { return false }
         let completedAt = now()
         promptCompletedAt = completedAt; warnedSoon = false
+        let latchedAt = earlyAffirmativeAt
+        clearEarlyLatch()
+        if let latchedAt, completedAt.timeIntervalSince(latchedAt) <= timeout {
+            state = .arming(action, confirmedAt: completedAt)
+            return true
+        }
         state = .awaitingConfirmation(action, deadline: completedAt.addingTimeInterval(timeout))
+        return false
     }
     /// Echo gate: true while the model's TTS is audible. A confirmation is
     /// accepted only while this is false — the read-back can never confirm
@@ -85,7 +110,10 @@ public actor PendingActionGate {
     public func tick() -> Tick {
         guard case .awaitingConfirmation(let action, let deadline) = state else { return .idle }
         let remaining = deadline.timeIntervalSince(speechPausedAt ?? now())
-        if speechPausedAt == nil && remaining <= 0 { state = .cancelled(action, .timeout); return .expired }
+        if speechPausedAt == nil && remaining <= 0 {
+            clearEarlyLatch()
+            state = .cancelled(action, .timeout); return .expired
+        }
         if remaining <= Self.warningWindow && !warnedSoon { warnedSoon = true; return .expiringSoon(remaining: max(0, remaining)) }
         return .counting(remaining: max(0, remaining))
     }
@@ -101,37 +129,109 @@ public actor PendingActionGate {
             return .ignored("no pending action")
         case .arming(let action, _):
             if SafetyText.containsAny(Self.negations, in: transcript) {
+                clearEarlyLatch()
                 state = .cancelled(action, .negation); return .cancelled(.negation)
             }
             return .ignored("already confirmed; arm window in progress")
         case .awaitingTurnComplete(let action):
             if SafetyText.containsAny(Self.negations, in: transcript) {
+                clearEarlyLatch()
                 state = .cancelled(action, .negation); return .cancelled(.negation)
             }
-            return .ignored("prompt not finished")
+            guard SafetyText.containsAny(Self.affirmatives, in: transcript) else {
+                return .ignored("prompt not finished")
+            }
+            if speakerIsActive { return .ignored("echo gate not clear") }
+            // Financial actions never latch: the amount read-back has not
+            // happened yet, so the confirmation cannot be trusted (Tier 4).
+            guard action.tier != .financial else { return .ignored("prompt not finished") }
+            // The user answered while the model was still speaking the prompt;
+            // keep the decision instead of dropping it and timing out.
+            earlyAffirmativeAt = spokeAt; earlyLatchSource = .voice
+            return .ignored("early affirmative latched until the prompt completes")
         case .awaitingConfirmation(let action, let deadline):
             let extended = pausedSince.map { deadline.addingTimeInterval(max(0, spokeAt.timeIntervalSince($0))) } ?? deadline
             if SafetyText.containsAny(Self.negations, in: transcript) {
+                clearEarlyLatch()
                 state = .cancelled(action, .negation); return .cancelled(.negation)
             }
             if extended != deadline { state = .awaitingConfirmation(action, deadline: extended) }
-            if spokeAt >= extended { state = .cancelled(action, .timeout); return .cancelled(.timeout) }
+            if spokeAt >= extended {
+                clearEarlyLatch()
+                state = .cancelled(action, .timeout); return .cancelled(.timeout)
+            }
             if speakerIsActive { return .ignored("echo gate not clear") }
             if !SafetyText.containsAny(Self.affirmatives, in: transcript) { return .ignored("no affirmative") }
             if action.tier == .financial {
                 guard let expected = action.expectedAmount else { return .ignored("Tier 4 action without an expected amount") }
-                if let promptAt = promptCompletedAt, spokeAt < promptAt.addingTimeInterval(Self.financialLock) {
+                // Fail closed: without a prompt-completion timestamp the
+                // read-back lock cannot be verified, so the confirmation is
+                // refused rather than allowed through.
+                guard let promptAt = promptCompletedAt else { return .ignored("financial lock") }
+                if spokeAt < promptAt.addingTimeInterval(Self.financialLock) {
                     return .ignored("financial lock")
                 }
                 guard AmountNormalizer.matches(expected: expected, in: transcript) else { return .ignored("amount mismatch") }
-            } else {
-                guard !action.anchors.isEmpty else { return .ignored("no anchors configured") }
-                guard action.anchors.contains(where: { SafetyText.allTokensPresent($0, in: transcript) }) else {
-                    return .ignored("no action echo")
-                }
             }
+            // Spec §4.4 script: the completed prompt already named the action and
+            // target ("Say Haan to confirm, or Ruko to cancel"); a clear
+            // affirmative is sufficient for Tier 3. Negation won above; the echo
+            // gate and the arm window/revalidation still apply. (The previous
+            // anchor-echo requirement was stricter than the spec's validated
+            // script and made a bare "Haan" silently fail.)
             state = .arming(action, confirmedAt: spokeAt)
             return .accepted
+        }
+    }
+    /// On-screen card confirmation (direct input, not voice). Mirrors
+    /// `userSpoke`'s state machine: the Tier 4 financial lock still applies, an
+    /// early tap during the prompt latches exactly like an early "Haan", and
+    /// the arm window + TOCTOU revalidation remain the only execution path.
+    @discardableResult
+    public func userConfirmed() -> DirectDecision {
+        let decidedAt = now()
+        switch state {
+        case .awaitingConfirmation(let action, let deadline):
+            // Direct input must fail closed at the deadline too, not only when
+            // the countdown driver's tick() has already expired the action.
+            if speechPausedAt == nil && decidedAt >= deadline {
+                clearEarlyLatch()
+                state = .cancelled(action, .timeout)
+                return .ignored("expired")
+            }
+            if action.tier == .financial {
+                // Fail closed: a missing prompt-completion timestamp must not
+                // drop the read-back lock (a tap could otherwise confirm before
+                // the amount was spoken).
+                guard let promptAt = promptCompletedAt else { return .ignored("financial lock") }
+                if decidedAt < promptAt.addingTimeInterval(Self.financialLock) {
+                    return .ignored("financial lock")
+                }
+            }
+            state = .arming(action, confirmedAt: decidedAt)
+            return .accepted
+        case .awaitingTurnComplete(let action):
+            guard action.tier != .financial else {
+                return .ignored("financial action requires the amount read-back")
+            }
+            earlyAffirmativeAt = decidedAt; earlyLatchSource = .direct
+            return .latched
+        case .arming:
+            return .ignored("already confirmed; arm window in progress")
+        case .idle, .confirmed, .cancelled:
+            return .ignored("no pending action")
+        }
+    }
+    /// On-screen card cancellation (direct input, not voice). Cancels any
+    /// pending state with `.negation`; returns whether it cancelled.
+    @discardableResult
+    public func userCancelled() -> Bool {
+        switch state {
+        case .awaitingTurnComplete, .awaitingConfirmation, .arming:
+            cancel(reason: .negation)
+            return true
+        default:
+            return false
         }
     }
     /// Hard ≥500 ms floor between confirmation and hardware execution, with
@@ -158,6 +258,7 @@ public actor PendingActionGate {
     public func cancel(reason: CancelReason = .killed) {
         switch state {
         case .awaitingTurnComplete(let action), .awaitingConfirmation(let action, _), .arming(let action, _):
+            clearEarlyLatch()
             state = .cancelled(action, reason)
         default:
             break
@@ -166,6 +267,12 @@ public actor PendingActionGate {
     private func abortReason(for id: UUID) -> CancelReason {
         if case .cancelled(let action, let reason) = state, action.id == id { return reason }
         return .superseded
+    }
+    /// Clears the latched early affirmative and its source marker together so
+    /// they can never drift apart.
+    private func clearEarlyLatch() {
+        earlyAffirmativeAt = nil
+        earlyLatchSource = nil
     }
     static let negations = [
         "no", "not", "nahi", "nahin", "nako", "naka", "ruko", "ruk", "thamba", "thamb", "stop", "cancel",

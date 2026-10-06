@@ -3,8 +3,21 @@ import Foundation
 // MARK: - Endpoint (spec §4.1; errata A1 model, A4 constrained endpoint is v1beta)
 
 public enum GeminiEndpoint {
+    /// Spec §4.1 default Live model (errata A1). Never change without the spec.
     public static let modelName = "models/gemini-3.8-live"
     public static let defaultVoiceName = "Aoede"
+
+    /// Live-tuning override for the day-0 spike: `CLICKY_GEMINI_MODEL` selects a
+    /// different Live model without a rebuild. Missing, blank, or whitespace-only
+    /// values keep the spec default; a bare id is normalized to the
+    /// `models/`-prefixed resource name the Live API expects.
+    public static func resolvedModelName(
+        environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
+        guard let raw = environment["CLICKY_GEMINI_MODEL"] else { return modelName }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return modelName }
+        return trimmed.hasPrefix("models/") ? trimmed : "models/" + trimmed
+    }
 
     /// Hackathon build: API key from the environment (never embedded). Production
     /// path (not built here): backend-minted ephemeral tokens against the `v1beta`
@@ -194,8 +207,9 @@ public enum GeminiSetupBuilder {
                             tools: [GeminiTool]? = nil,
                             voiceName: String = GeminiEndpoint.defaultVoiceName,
                             resumptionHandle: String? = nil,
-                            vad: GeminiAutomaticActivityDetection = .clickyDefault) -> GeminiSetup {
-        GeminiSetup(model: GeminiEndpoint.modelName,
+                            vad: GeminiAutomaticActivityDetection = .clickyDefault,
+                            model: String = GeminiEndpoint.resolvedModelName()) -> GeminiSetup {
+        GeminiSetup(model: model,
                     generationConfig: GeminiGenerationConfig(responseModalities: ["AUDIO"],
                                                              speechConfig: GeminiSpeechConfig(voiceName: voiceName)),
                     systemInstruction: GeminiContent(text: systemInstruction),

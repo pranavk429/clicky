@@ -134,14 +134,21 @@ public struct SynthesisPacing: Sendable {
     public var verificationPollInterval: Duration
     public var dragSteps: Int
     public var dragStepInterval: Duration
+    /// Hold between left-mouse-down and left-mouse-up in `postClick`. Events
+    /// posted back-to-back share a timestamp and WebKit/Chrome/AppKit drop such
+    /// clicks; ~35 ms is the OpenClicky-proven value. `.instant` zeroes it.
+    public var clickHold: Duration
     public init(verificationPollCount: Int = 3, verificationPollInterval: Duration = .milliseconds(50),
-                dragSteps: Int = 8, dragStepInterval: Duration = .milliseconds(4)) {
+                dragSteps: Int = 8, dragStepInterval: Duration = .milliseconds(4),
+                clickHold: Duration = .milliseconds(35)) {
         self.verificationPollCount = verificationPollCount; self.verificationPollInterval = verificationPollInterval
         self.dragSteps = dragSteps; self.dragStepInterval = dragStepInterval
+        self.clickHold = clickHold
     }
     public static let `default` = SynthesisPacing()
     public static let instant = SynthesisPacing(verificationPollCount: 1, verificationPollInterval: .zero,
-                                                dragSteps: 2, dragStepInterval: .zero)
+                                                dragSteps: 2, dragStepInterval: .zero,
+                                                clickHold: .zero)
 }
 
 // MARK: - EventSynthesizer
@@ -225,27 +232,64 @@ public actor EventSynthesizer {
 
     // MARK: Pointers, scroll and keys
 
+    /// Named keys keep their historical names; letters/digits use ANSI virtual keycodes.
+    private static let namedKeyCodes: [String: CGKeyCode] = [
+        "return": 36, "enter": 36, "escape": 53, "esc": 53, "tab": 48, "space": 49,
+        "down": 125, "up": 126, "left": 123, "right": 124,
+    ]
+    private static let letterKeyCodes: [String: CGKeyCode] = [
+        "a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4, "i": 34,
+        "j": 38, "k": 40, "l": 37, "m": 46, "n": 45, "o": 31, "p": 35, "q": 12,
+        "r": 15, "s": 1, "t": 17, "u": 32, "v": 9, "w": 13, "x": 7, "y": 16, "z": 6,
+    ]
+    private static let digitKeyCodes: [String: CGKeyCode] = [
+        "0": 29, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
+    ]
+
+    /// Parses a plain key name (`"return"`) or a `+`-separated chord
+    /// (`"cmd+t"`, `"cmd+shift+t"`, `"⌘+shift+t"`). Tokens are trimmed and
+    /// case-insensitive; modifiers are cmd/command/⌘, shift/⇧,
+    /// opt/option/alt/⌥, ctrl/control/⌃. The final token must be a letter,
+    /// digit, or named key. Any unknown token returns nil so callers fail closed.
+    private static func keyChord(from spec: String) -> (keyCode: CGKeyCode, flags: CGEventFlags)? {
+        let tokens = spec.components(separatedBy: "+")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        guard let keyToken = tokens.last, !keyToken.isEmpty else { return nil }
+        var flags: CGEventFlags = []
+        for token in tokens.dropLast() {
+            switch token {
+            case "cmd", "command", "⌘": flags.insert(.maskCommand)
+            case "shift", "⇧": flags.insert(.maskShift)
+            case "opt", "option", "alt", "⌥": flags.insert(.maskAlternate)
+            case "ctrl", "control", "⌃": flags.insert(.maskControl)
+            default: return nil
+            }
+        }
+        guard let keyCode = namedKeyCodes[keyToken] ?? letterKeyCodes[keyToken] ?? digitKeyCodes[keyToken] else { return nil }
+        return (keyCode, flags)
+    }
+
     /// `AXPressAction` first; on any AX failure, hover + synthetic click at
     /// `fallbackPoint` (or the element's resolved center).
     @discardableResult
-    public func click(element: AXUIElement, fallbackPoint: CGPoint? = nil) -> PressOutcome {
+    public func click(element: AXUIElement, fallbackPoint: CGPoint? = nil) async -> PressOutcome {
         _ = secureGuard.decision(for: .pointerClick, targets: [element])
         let error = elements.performPress(on: element)
         if error == .success { return .axPressed }
         guard let point = fallbackPoint ?? elements.elementCenter(element) else { return .noTargetPoint(triggering: error) }
-        postClick(at: point)
+        await postClick(at: point)
         return .clickFallback(triggering: error)
     }
 
     @discardableResult
-    public func press(_ element: AXUIElement, fallbackPoint: CGPoint) -> PressOutcome {
-        click(element: element, fallbackPoint: fallbackPoint)
+    public func press(_ element: AXUIElement, fallbackPoint: CGPoint) async -> PressOutcome {
+        await click(element: element, fallbackPoint: fallbackPoint)
     }
 
     @discardableResult
-    public func click(at point: CGPoint) -> SecureInputDecision {
+    public func click(at point: CGPoint) async -> SecureInputDecision {
         let decision = secureGuard.decision(for: .pointerClick)
-        postClick(at: point)
+        await postClick(at: point)
         return decision
     }
 
@@ -257,19 +301,28 @@ public actor EventSynthesizer {
     @discardableResult
     public func scroll(_ direction: String, on element: AXUIElement? = nil) -> Bool {
         _ = secureGuard.decision(for: .pointerMove)
-        let delta: Int32 = (direction.lowercased() == "up") ? 5 : -5
+        // "up"/"down", optionally with a count ("down 2") for larger scrolls;
+        // 15 lines per unit so one call moves roughly half a page (the old ±5
+        // was too small to register as scrolling for most users).
+        let parts = direction.lowercased().split(separator: " ")
+        let up = parts.first.map { $0.hasPrefix("up") } ?? false
+        let units = parts.compactMap { Int($0) }.first.map { max(1, min(5, $0)) } ?? 1
+        let delta: Int32 = Int32(15 * units) * (up ? 1 : -1)
         let point = element.flatMap { elements.elementCenter($0) } ?? poster.currentCursorLocation()
         poster.postScroll(delta: delta, at: point)
         return true
     }
 
+    /// Presses a single named key (`"return"`, `"escape"`, arrows, …) or a
+    /// modifier chord (`"cmd+t"`, `"cmd+shift+t"`) at keyboard focus. Returns
+    /// `false` and posts nothing while the secure-input guard blocks or when
+    /// any token is unknown.
     @discardableResult
     public func pressKey(_ key: String, on element: AXUIElement? = nil) -> Bool {
         let decision = secureGuard.decision(for: .keystrokes, targets: element.map { [$0] } ?? [])
         guard decision.allowed else { return false }
-        let keyCodes: [String: CGKeyCode] = ["return": 36, "enter": 36, "escape": 53, "esc": 53, "tab": 48, "space": 49, "down": 125, "up": 126, "left": 123, "right": 124]
-        guard let keyCode = keyCodes[key.lowercased()] else { return false }
-        poster.postKeyChord(keyCode: keyCode, flags: [])
+        guard let chord = Self.keyChord(from: key) else { return false }
+        poster.postKeyChord(keyCode: chord.keyCode, flags: chord.flags)
         return true
     }
 
@@ -310,8 +363,16 @@ public actor EventSynthesizer {
         return true
     }
 
-    private func postClick(at point: CGPoint) {
+    /// Posts hover → down → (click hold) → up. The hold exists because
+    /// WebKit/Chrome/AppKit drop clicks whose down and up events share a
+    /// timestamp (the events used to be posted back-to-back, 0 µs apart);
+    /// `SynthesisPacing.clickHold` is ~35 ms by default. The `defer` guarantees
+    /// the mouse-up is posted even when the task is cancelled mid-hold (kill
+    /// switch / barge-in), so no button state is ever left held.
+    private func postClick(at point: CGPoint) async {
         poster.postMouse(type: .mouseMoved, at: point)
-        poster.postMouse(type: .leftMouseDown, at: point); poster.postMouse(type: .leftMouseUp, at: point)
+        poster.postMouse(type: .leftMouseDown, at: point)
+        defer { poster.postMouse(type: .leftMouseUp, at: point) }
+        try? await Task.sleep(for: max(pacing.clickHold, .zero))
     }
 }

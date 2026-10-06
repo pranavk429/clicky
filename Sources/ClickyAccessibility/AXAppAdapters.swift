@@ -13,6 +13,12 @@ public enum AXAppFamily: Equatable, Sendable {
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: frameworks.path) else { return .native }
         if entries.contains(where: { $0.hasPrefix("Electron Framework") }) { return .electron }
         if entries.contains(where: { $0.contains("Chromium Framework") || $0.contains("Chrome Framework") }) { return .chromium }
+        // Vendor-branded Chromium forks rename the framework after the product
+        // ("Comet Framework.framework" — verified on the demo machine). Electron
+        // is matched above; a native app embedding "<Name> Framework.framework"
+        // would be misdetected, but the wake attribute set is a no-op on apps
+        // that do not support it, so the failure mode is benign.
+        if entries.contains(where: { $0.hasSuffix(" Framework.framework") }) { return .chromium }
         return .native
     }
 }
@@ -64,10 +70,11 @@ public enum AXAppAdapters {
             _ = AXUIElementSetAttributeValue(app, attribute as CFString, previous)
         }
     }
-    /// Probes for `AXWebArea` under the app's focused window via a dedicated bounded
-    /// search (the web area may nest deeper than the action crawler's depth budget);
-    /// retries once after `wakeRetryDelayMilliseconds` because the web tree is built
-    /// asynchronously after enablement (B6).
+    /// Probes for `AXWebArea` under the app's focused window via a dedicated
+    /// bounded search: the depth cap matches `CrawlerBudget.maxDepth`, so a
+    /// negative probe rules out what a re-crawl could reach; the node cap stays
+    /// probe-local. Retries once after `wakeRetryDelayMilliseconds` because the
+    /// web tree is built asynchronously after enablement (B6).
     public static func waitForTreeWake(pid: pid_t) async -> Bool {
         let factory = RealAXNodeFactory()
         if hasWebArea(factory: factory, pid: pid) { return true }
@@ -81,11 +88,12 @@ public enum AXAppAdapters {
         }
         return hasWebArea(factory: factory, pid: pid)
     }
-    /// Local budgets for the wake probe: the web area nests deeper than the
-    /// action crawler's depth budget on current Chromium builds (measured
-    /// 2026-10-06: `AXWebArea` at depth 7 on VS Code 1.140.0 and Antigravity IDE),
-    /// so the probe searches with its own caps instead of reusing `CrawlerBudget`.
-    static let wakeProbeMaxDepth = 10
+    /// Wake-probe budgets: the probe is the post-wake existence check for the
+    /// asynchronously built tree. Its depth cap is shared with `CrawlerBudget`, so
+    /// a negative probe rules out what the re-crawl could reach (measured
+    /// 2026-10-06: `AXWebArea` at depth 7 on VS Code 1.140.0 and Antigravity IDE,
+    /// within both budgets); the node cap stays probe-local as a cost bound.
+    static let wakeProbeMaxDepth = CrawlerBudget.maxDepth
     static let wakeProbeMaxNodes = 2_000
 
     /// Probes for `AXWebArea` under the app's focused window. Performs synchronous

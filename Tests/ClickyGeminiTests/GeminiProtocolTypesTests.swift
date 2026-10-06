@@ -55,11 +55,33 @@ final class GeminiProtocolTypesTests: XCTestCase {
                 GeminiFunctionDeclaration(name: "execute_action",
                                           description: "Execute one resolved UI action.",
                                           parameters: .object(["type": .string("object"),
-                                                               "properties": .object([:])]))])])
+                                                               "properties": .object([:])]))])],
+            model: GeminiEndpoint.modelName)   // pinned: the fixture describes the spec default
         let encoded = try JSONEncoder().encode(GeminiClientMessage.setup(setup))
         try assertJSONEquals(encoded, Fixtures.setup)
         struct Envelope: Decodable { let setup: GeminiSetup }
         XCTAssertEqual(try JSONDecoder().decode(Envelope.self, from: encoded).setup, setup)
+    }
+
+    func testResolvedModelNameDefaultsAndNormalizesOverride() {
+        XCTAssertEqual(GeminiEndpoint.resolvedModelName(environment: [:]),
+                       "models/gemini-3.8-live", "missing env keeps the spec default")
+        XCTAssertEqual(GeminiEndpoint.resolvedModelName(environment: ["CLICKY_GEMINI_MODEL": ""]),
+                       "models/gemini-3.8-live", "empty env keeps the spec default")
+        XCTAssertEqual(GeminiEndpoint.resolvedModelName(environment: ["CLICKY_GEMINI_MODEL": "   "]),
+                       "models/gemini-3.8-live", "whitespace-only env keeps the spec default")
+        XCTAssertEqual(GeminiEndpoint.resolvedModelName(environment: ["CLICKY_GEMINI_MODEL": "gemini-3.8-live-preview"]),
+                       "models/gemini-3.8-live-preview", "a bare id gains the models/ prefix")
+        XCTAssertEqual(GeminiEndpoint.resolvedModelName(environment: ["CLICKY_GEMINI_MODEL": "models/gemini-3.8-live-preview"]),
+                       "models/gemini-3.8-live-preview", "an already-prefixed id is left intact")
+        XCTAssertEqual(GeminiEndpoint.resolvedModelName(environment: ["CLICKY_GEMINI_MODEL": "  gemini-3.8-live  "]),
+                       "models/gemini-3.8-live", "surrounding whitespace is trimmed")
+    }
+
+    func testSetupBuilderHonorsExplicitModel() {
+        let setup = GeminiSetupBuilder.make(systemInstruction: "Test.",
+                                            model: "models/gemini-3.8-live-preview")
+        XCTAssertEqual(setup.model, "models/gemini-3.8-live-preview")
     }
 
     func testSetupWithResumptionHandleEncodesHandle() throws {

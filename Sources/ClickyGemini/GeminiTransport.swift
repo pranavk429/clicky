@@ -3,6 +3,10 @@ import Foundation
 /// One bidirectional frame pipe. Implementations: `URLSessionWebSocketTransport`
 /// (production/hackathon), `FakeTransport` (Tests/ClickyGeminiTests), `MockSession`
 /// (shipped demo fallback).
+///
+/// Framing is TEXT-first (RFC 6455 opcode 0x1): every Clicky payload is JSON —
+/// audio rides base64 inside JSON — and the Live gateway's edge proxies reject
+/// BINARY frames.
 public protocol GeminiTransport: Sendable {
     func connect() async throws
     func send(_ data: Data) async throws
@@ -26,7 +30,14 @@ public actor URLSessionWebSocketTransport: GeminiTransport {
 
     public func connect() async throws { task.resume() }
 
-    public func send(_ data: Data) async throws { try await task.send(.data(data)) }
+    /// UTF-8-decodable payloads go out as TEXT frames (the gateway's requirement);
+    /// non-UTF-8 bytes fall back to BINARY so the helper stays total.
+    public static func message(for data: Data) -> URLSessionWebSocketTask.Message {
+        if let text = String(data: data, encoding: .utf8) { return .string(text) }
+        return .data(data)
+    }
+
+    public func send(_ data: Data) async throws { try await task.send(Self.message(for: data)) }
 
     public func receive() async throws -> Data {
         let message = try await task.receive()

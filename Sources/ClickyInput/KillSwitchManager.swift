@@ -3,10 +3,13 @@ import Foundation
 import os
 
 /// The local-first stop path (spec §4.4; Validation 01 §2.3). Two triggers converge here:
-/// the energy-onset VAD (primary — no server round-trip) and the ⌘⇧X Carbon chord. The
-/// interruption flag flips BEFORE any hook runs, so the safety layer that reads
-/// `isInterrupted` fails closed; the server `interrupted` frame is confirmation only.
-/// `reset()` re-arms at the start of each turn.
+/// the energy-onset VAD (primary — no server round-trip) and the ⌘⇧X Carbon chord. Each
+/// path owns its own one-shot latch per turn: a voice barge-in stops playback only, while
+/// the hardware kill switch always runs its full stop sequence — an emergency stop must
+/// never be masked by a barge-in that already latched. `isInterrupted` is fail-closed: it
+/// reads true once either latch has flipped, BEFORE any hook runs, so the safety layer
+/// fails closed; the server `interrupted` frame is confirmation only. `reset()` re-arms
+/// both latches at the start of each turn.
 public final class KillSwitchManager: @unchecked Sendable {
     public enum Source: String, Equatable, Sendable {
         case voiceOnset, hotKey, menuBar
@@ -42,14 +45,18 @@ public final class KillSwitchManager: @unchecked Sendable {
     private let hooks: Hooks
     private let lock = NSLock()
     private let log = Logger(subsystem: "com.clicky.mac", category: "barge-in")
-    private var interrupted = false
+    private var bargeInLatched = false
+    private var killSwitchFired = false
     private var lastSource: Source?
     private var lastLatencyMs: Double?
     private var hotKey: GlobalHotKey?
 
     public init(hooks: Hooks) { self.hooks = hooks }
 
-    public var isInterrupted: Bool { lock.lock(); defer { lock.unlock() }; return interrupted }
+    public var isInterrupted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return bargeInLatched || killSwitchFired
+    }
     public var lastTriggerSource: Source? { lock.lock(); defer { lock.unlock() }; return lastSource }
     /// T7−T1 when the caller supplies the onset instant; nil for the hotkey path.
     public var lastBargeInMilliseconds: Double? { lock.lock(); defer { lock.unlock() }; return lastLatencyMs }
@@ -70,20 +77,22 @@ public final class KillSwitchManager: @unchecked Sendable {
     }
 
     /// Voice path: stop playback and clear queued playback/actions. Returns false while
-    /// already latched (one trigger per turn).
+    /// already interrupted — one barge-in per turn, and none after a kill switch.
     @discardableResult
     public func triggerBargeIn(source: Source = .voiceOnset, onset: ContinuousClock.Instant? = nil) -> Bool {
-        guard latch() else { return false }
+        guard latchBargeIn() else { return false }
         hooks.stopPlayback()
         record(source: source, onset: onset)
         NotificationCenter.default.post(name: Self.notificationName, object: source)
         return true
     }
 
-    /// Hardware path: barge-in + release synthetic input + banner + session stop.
+    /// Hardware path: barge-in + release synthetic input + banner + session stop. Runs its
+    /// full hook sequence even when a voice barge-in already latched this turn — the
+    /// emergency stop must never be masked. A second kill switch before `reset()` is a no-op.
     @discardableResult
     public func triggerKillSwitch(source: Source) -> Bool {
-        guard latch() else { return false }
+        guard latchKillSwitch() else { return false }
         hooks.stopPlayback()
         hooks.releaseSyntheticInput()
         hooks.presentBanner("Clicky stopped (\(source.displayName))")
@@ -93,13 +102,27 @@ public final class KillSwitchManager: @unchecked Sendable {
         return true
     }
 
-    /// Re-arm for the next turn.
-    public func reset() { lock.lock(); interrupted = false; lock.unlock() }
+    /// Re-arm both paths for the next turn.
+    public func reset() {
+        lock.lock()
+        bargeInLatched = false
+        killSwitchFired = false
+        lock.unlock()
+    }
 
-    private func latch() -> Bool {
+    /// One barge-in per turn; blocked once interrupted (including after a kill switch).
+    private func latchBargeIn() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !interrupted else { return false }
-        interrupted = true
+        guard !bargeInLatched, !killSwitchFired else { return false }
+        bargeInLatched = true
+        return true
+    }
+
+    /// One kill switch per turn, independent of the barge-in latch.
+    private func latchKillSwitch() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !killSwitchFired else { return false }
+        killSwitchFired = true
         return true
     }
 

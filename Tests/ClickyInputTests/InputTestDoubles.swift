@@ -35,15 +35,17 @@ func makeSentinelElement() -> AXUIElement {
 }
 
 /// Records posted events instead of posting them (no permissions needed).
+/// Mouse events carry a timestamp so click pacing (down → hold → up) is
+/// assertable without touching real hardware.
 final class RecordingEventPoster: EventPosting, @unchecked Sendable {
     var unicodeChunks: [String] = []
     var chords: [(keyCode: CGKeyCode, flags: CGEventFlags)] = []
-    var mouseEvents: [(type: CGEventType, point: CGPoint)] = []
+    var mouseEvents: [(type: CGEventType, point: CGPoint, timestamp: Date)] = []
     var scrollEvents: [(delta: Int32, point: CGPoint)] = []
     var cursorLocation = CGPoint(x: 10, y: 20)
     func postUnicode(_ text: String) { unicodeChunks.append(text) }
     func postKeyChord(keyCode: CGKeyCode, flags: CGEventFlags) { chords.append((keyCode, flags)) }
-    func postMouse(type: CGEventType, at point: CGPoint) { mouseEvents.append((type, point)) }
+    func postMouse(type: CGEventType, at point: CGPoint) { mouseEvents.append((type, point, Date())) }
     func postScroll(delta: Int32, at point: CGPoint) { scrollEvents.append((delta, point)) }
     func currentCursorLocation() -> CGPoint { cursorLocation }
 }

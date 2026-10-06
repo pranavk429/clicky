@@ -30,13 +30,17 @@ public enum ElementMatcher {
             .sorted { $0.score > $1.score }
     }
     /// Exact 1.0 · contains 0.6 · token Jaccard × 0.4 (threshold 0.5).
+    /// Matches title, description, or `kAXValueAttribute` text (search bars and
+    /// text fields store their content in the value, not the title).
     /// Role hint: ×1.2 on match, ×0.5 on mismatch. Disabled ×0.5.
     /// Secure fields always 0 — credentials are Tier-5 territory, never a target.
     public static func score(query: ElementQuery, candidate: ElementSnapshot) -> Double {
         guard !candidate.isSecureField else { return 0 }
         let wanted = normalize(query.text)
         guard !wanted.isEmpty else { return 0 }
-        var score = max(similarity(wanted, candidate.key.title), similarity(wanted, candidate.key.description))
+        var score = max(similarity(wanted, candidate.key.title),
+                        similarity(wanted, candidate.key.description),
+                        similarity(wanted, candidate.value))
         guard score > 0 else { return 0 }
         if let role = query.role {
             score *= normalize(role) == candidate.key.role ? 1.2 : 0.5

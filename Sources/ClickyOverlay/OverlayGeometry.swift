@@ -12,4 +12,25 @@ public enum OverlayGeometry {
     public static func localPoint(fromCGGlobal point: CGPoint, onScreen screen: CGRect) -> CGPoint {
         CGPoint(x: point.x - screen.origin.x, y: point.y - screen.origin.y)
     }
+
+    /// Global CG frame (top-left of the primary, y down) for a small panel of
+    /// `size` centered on a panel-local point of `screen`. Places the
+    /// interactive confirmation-card panel exactly where the pure card layout
+    /// (`OverlayLayout.cardCenter`) would draw the card in the full-screen
+    /// panel.
+    public static func globalFrame(centeredAtLocalPoint local: CGPoint,
+                                   size: CGSize,
+                                   onScreen screen: CGRect) -> CGRect {
+        CGRect(x: screen.minX + local.x - size.width / 2,
+               y: screen.minY + local.y - size.height / 2,
+               width: size.width,
+               height: size.height)
+    }
+
+    /// Inverse of `CoordinateMath.cgFrame(fromAppKit:primaryHeight:)`:
+    /// converts a global CG (top-left, y down) frame to the AppKit global frame
+    /// (bottom-left, y up) that `NSWindow.setFrame(_:display:)` expects.
+    public static func appKitFrame(fromCGGlobal frame: CGRect, primaryHeight: CGFloat) -> CGRect {
+        CGRect(x: frame.minX, y: primaryHeight - frame.maxY, width: frame.width, height: frame.height)
+    }
 }

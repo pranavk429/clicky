@@ -18,7 +18,8 @@ final class MockSessionTests: XCTestCase {
         let markers = Recorder<GeminiMarker>()
         let client = GeminiLiveClient(
             transportFactory: { mock },
-            setupFactory: { _ in GeminiSetupBuilder.make(systemInstruction: "Mock.") },
+            setupFactory: { _ in GeminiSetupBuilder.make(systemInstruction: "Mock.",
+                                                         model: GeminiEndpoint.modelName) },
             toolHandler: handler,
             onServerContent: { content in
                 if let text = content.inputTranscription?.text {
