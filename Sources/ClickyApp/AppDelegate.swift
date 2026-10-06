@@ -19,8 +19,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.toolTip = "Clicky — voice cursor"
         statusItem = item
         rebuildMenu()
-        NotificationCenter.default.addObserver(forName: .clickySessionStateChanged, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.rebuildMenu() }
+        NotificationCenter.default.addObserver(forName: .clickySessionStateChanged, object: nil, queue: .main) { [weak self] note in
+            let state = note.object as? SessionState
+            Task { @MainActor in
+                // Re-arm the registered ⌘⇧X manager for every listening session: it
+                // latches on the first trigger, so without this reset the second
+                // kill-switch press never fires (spec §4.4 one-trigger-per-turn latch).
+                if state == .listening { self?.killSwitch?.reset() }
+                self?.rebuildMenu()
+            }
         }
         PermissionsCenter.shared.startWatchdog()
         PermissionsCenter.shared.onRevocation = { [weak self] kind in

@@ -83,10 +83,11 @@ struct TestAudio: AudioSessionPort {
     func stopPlaybackNow() async {}
 }
 
-struct TestStopSignal: StopSignalPort {
+actor TestStopSignal: StopSignalPort {
+    private(set) var resets = 0
     func start(onStop: @escaping @Sendable (StopReason) -> Void) async {}
     func stop() async {}
-    func resetLatch() async {}
+    func resetLatch() async { resets += 1 }
     func triggerBargeIn(onset: ContinuousClock.Instant) async {}
 }
 
@@ -96,8 +97,11 @@ final class SessionCoordinatorTests: XCTestCase {
         let system = TestSystemSpy()
         let overlay = TestOverlaySpy()
         let gate = TestGateBridge()
+        // RealSleeper honours the scenario's afterMs sequencing: the 1500 ms gap
+        // before the "No, cancel that!" beat is what guarantees the gate has armed
+        // before the cancel arrives (ImmediateSleeper collapses that ordering).
         let mock = try MockSession(scenarioJSON: SessionCoordinator.demoCancelScenarioJSON(),
-                                   sleeper: ImmediateSleeper())
+                                   sleeper: RealSleeper())
         let coordinator = SessionCoordinator(
             ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
             system: system, overlay: overlay, gate: gate,
@@ -120,6 +124,24 @@ final class SessionCoordinatorTests: XCTestCase {
         // The gate submits every input transcription (the pre-arm "Delete my project
         // note" utterance included); the spoken cancel is the last one it sees.
         XCTAssertEqual(transcripts.last, "No, cancel that!")
+        await coordinator.stop(reason: .userToggle)
+    }
+
+    /// The kill-switch latches on the first trigger, so every listening session must
+    /// re-arm it (spec §4.4). The registered Carbon chord cannot be exercised headless;
+    /// this pins the session seam that the app's `.listening` reset hangs off.
+    func testSessionStartReArmsTheStopSignal() async throws {
+        let stopSignal = TestStopSignal()
+        let scenario = #"{"name":"noop","frames":[{"afterMs":0,"json":"{\"setupComplete\":{}}"}]}"#
+        let mock = try MockSession(scenarioJSON: scenario, sleeper: ImmediateSleeper())
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: TestAudio(), stopSignal: stopSignal, transportFactory: { mock })
+        await coordinator.start()
+
+        let resets = await stopSignal.resets
+        XCTAssertGreaterThanOrEqual(resets, 1, "session start must re-arm the latched kill switch")
         await coordinator.stop(reason: .userToggle)
     }
 }

@@ -404,11 +404,12 @@ actor AudioAdapter: AudioSessionPort {
 // MARK: - Kill-switch adapter
 
 /// The session's local stop seam. This manager is NOT hotkey-registered: the app's
-/// single ⌘⇧X registration lives in `AppDelegate.installHotKeys()` (a second
-/// registration on the same chord is unverified). `start(onStop:)` observes the
-/// app manager's `KillSwitchManager.notificationName` and delivers a full session
-/// stop for the ⌘⇧X / menu sources only; voice onset is a barge-in (playback stop)
-/// and never ends the session.
+/// single ⌘⇧X registration lives in `AppDelegate.installHotKeys()`. `start(onStop:)`
+/// observes `KillSwitchManager.notificationName` and delivers a full session stop
+/// for the ⌘⇧X / menu sources only; voice onset is a barge-in (playback stop) and
+/// never ends the session. The registered manager's own latch is re-armed by the app
+/// at each `.listening` transition (see `AppDelegate`), because this actor cannot see
+/// that instance.
 actor KillSwitchAdapter: StopSignalPort {
     private let manager: KillSwitchManager
     private var observer: NSObjectProtocol?
@@ -440,6 +441,8 @@ actor KillSwitchAdapter: StopSignalPort {
         onStop = nil
     }
 
+    /// Re-arms this session's own (VAD barge-in) latch. The registered ⌘⇧X
+    /// manager's latch is reset separately by the app at `.listening`.
     func resetLatch() async { manager.reset() }
 
     func triggerBargeIn(onset: ContinuousClock.Instant) async {
