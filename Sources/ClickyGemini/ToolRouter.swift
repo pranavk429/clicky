@@ -444,6 +444,12 @@ public actor ToolRouter: GeminiToolHandling {
 
     private static func intArg(_ args: [String: JSONValue]?, _ key: String) -> Int? {
         guard case .number(let value)? = args?[key] else { return nil }
+        // `max_nodes` is model-supplied and untrusted: converting an out-of-range
+        // or non-finite Double to Int traps (the same class of conversion
+        // RealSleeper bounds). Fall back to the caller's default/clamp path
+        // instead; in-range values keep Int(_:)'s truncation semantics. The upper
+        // bound is strict because Double(Int.max) rounds up to 2^63, which traps.
+        guard value.isFinite, value >= Double(Int.min), value < Double(Int.max) else { return nil }
         return Int(value)
     }
 }

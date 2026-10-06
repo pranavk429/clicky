@@ -217,6 +217,29 @@ final class ToolRouterTests: XCTestCase {
         let resolves = await fixture.system.resolves
         XCTAssertEqual(resolves, 0, "context is read-only")
     }
+
+    func testGetScreenContextClampsOutOfRangeMaxNodesWithoutTrapping() async throws {
+        let elements = (0..<500).map { index in
+            ScreenContextElement(role: "AXButton", subrole: nil, title: "Item \(index)",
+                                 elementDescription: nil, enabled: true, actions: ["AXPress"])
+        }
+        let context = ScreenContext(applicationName: "Notes", windowTitle: "Notes", elements: elements)
+        let router = ToolRouter(ledger: LedgerSpy(allowed: true), risk: RiskStub(tier: .reversible),
+                                screenContext: ContextStub(snapshot: context),
+                                system: SystemSpy(resolutions: []),
+                                overlay: OverlaySpy(), gate: GateScript(decision: .confirmed(source: .voiceTranscript)),
+                                sleeper: ImmediateSleeper())
+        let result = try await router.execute(GeminiToolCall.FunctionCall(
+            id: "ctx-out-of-range", name: ClickyTools.getScreenContext,
+            args: ["reason": .string("find the note"), "max_nodes": .number(1e20)]))
+        XCTAssertEqual(stringField(result, "status"), "ok")
+        XCTAssertEqual(result.scheduling, .silent)
+        guard case .object(let payload) = result.payload,
+              case .array(let returned)? = payload["elements"] else { return XCTFail("elements expected") }
+        XCTAssertLessThanOrEqual(returned.count, ToolRouter.contextMaxNodesCeiling, "ceiling never exceeded")
+        XCTAssertEqual(returned.count, ToolRouter.defaultContextMaxNodes,
+                       "an out-of-range max_nodes falls back to the default, then clamps")
+    }
 }
 
 actor KillSwitchSpy: KillSwitchPort {
