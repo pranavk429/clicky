@@ -259,4 +259,36 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(audioStops, 1, "the failure path must tear audio down")
         XCTAssertEqual(signalStops, 1, "the failure path must tear the stop signal down")
     }
+
+    /// Pins the mock scenario against the REAL T10 ledger: the scripted `execute_action`
+    /// intent must be traceable to the scenario's own transcribed utterance, or the
+    /// deferred mock beat returns `not_authorized` and never reaches the confirm/cancel
+    /// gate. Both strings are extracted from `demoCancelScenarioJSON()`, so the test
+    /// fails if either side (transcription or scripted intent) drifts.
+    func testMockScenarioIntentIsTraceableThroughTheRealLedger() async throws {
+        let messages = try Self.scenarioMessages()
+        let utterance = try XCTUnwrap(messages.compactMap { message -> String? in
+            guard case .serverContent(let content) = message else { return nil }
+            return content.inputTranscription?.text
+        }.first, "the scenario must script a voice utterance")
+        let intent = try XCTUnwrap(messages.compactMap { message -> String? in
+            guard case .toolCall(let call) = message else { return nil }
+            guard case .string(let value)? = call.functionCalls.first?.args?["intent"] else { return nil }
+            return value
+        }.first, "the scenario must script an execute_action intent")
+
+        let adapter = LedgerAdapter()
+        await adapter.recordVoiceUtterance(utterance, at: Date())
+        let authorized = await adapter.isTraceableToVoiceIntent(intent, at: Date())
+        XCTAssertTrue(authorized,
+                      "scripted intent '\(intent)' must be traceable to scripted utterance '\(utterance)' via the real IntentLedger")
+    }
+
+    /// Decodes the shipped mock scenario into server messages so the test compares the
+    /// exact scripted strings rather than hard-coded copies.
+    private static func scenarioMessages() throws -> [GeminiServerMessage] {
+        let json = try SessionCoordinator.demoCancelScenarioJSON()
+        let scenario = try JSONDecoder().decode(MockSession.Scenario.self, from: Data(json.utf8))
+        return scenario.frames.compactMap { GeminiServerMessage.decode(from: Data($0.json.utf8)) }
+    }
 }

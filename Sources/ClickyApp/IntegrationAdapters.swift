@@ -420,7 +420,7 @@ actor AudioAdapter: AudioSessionPort {
 /// never ends the session. The registered manager's own latch is re-armed by the app
 /// at each `.listening` transition (see `AppDelegate`), because this actor cannot see
 /// that instance.
-actor KillSwitchAdapter: StopSignalPort {
+actor KillSwitchAdapter: StopSignalPort, KillSwitchPort {
     private let manager: KillSwitchManager
     private var observer: NSObjectProtocol?
     private var onStop: (@Sendable (StopReason) -> Void)?
@@ -457,6 +457,16 @@ actor KillSwitchAdapter: StopSignalPort {
 
     func triggerBargeIn(onset: ContinuousClock.Instant) async {
         manager.triggerBargeIn(source: .voiceOnset, onset: onset)
+    }
+
+    /// `ToolRouter`'s circuit-breaker escalation port (spec §4.4): a latched breaker
+    /// asks the local kill switch to stop the session. Reuses this manager's hooks
+    /// (stop playback + release synthetic input) and its own notification observer,
+    /// which delivers the session stop. `KillSwitchManager.Source` has no breaker
+    /// case, so the hardware-path label `.hotKey` is used; nothing user-visible
+    /// depends on it (this adapter's banner hook is a no-op).
+    func triggerKillSwitch(source: String) async {
+        manager.triggerKillSwitch(source: .hotKey)
     }
 
     private func deliverStop() {

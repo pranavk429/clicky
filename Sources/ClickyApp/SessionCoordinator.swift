@@ -43,6 +43,7 @@ final class SessionCoordinator {
     let gate: any ConfirmationGatingPort
     let audio: any AudioSessionPort
     let stopSignal: any StopSignalPort
+    let killSwitch: (any KillSwitchPort)?
     let warmer: (any ScreenCacheWarming)?
     let transportFactory: TransportFactory
     let confirmationTimeout: TimeInterval
@@ -62,12 +63,14 @@ final class SessionCoordinator {
          screenContext: any ScreenContextProviding, system: any SystemActionPort,
          overlay: any GhostCursorPort, gate: any ConfirmationGatingPort,
          audio: any AudioSessionPort, stopSignal: any StopSignalPort,
+         killSwitch: (any KillSwitchPort)? = nil,
          warmer: (any ScreenCacheWarming)? = nil,
          transportFactory: @escaping TransportFactory,
          confirmationTimeout: TimeInterval = ToolRouter.defaultConfirmationTimeout) {
         self.ledger = ledger; self.risk = risk; self.screenContext = screenContext
         self.system = system; self.overlay = overlay; self.gate = gate
-        self.audio = audio; self.stopSignal = stopSignal; self.warmer = warmer
+        self.audio = audio; self.stopSignal = stopSignal; self.killSwitch = killSwitch
+        self.warmer = warmer
         self.transportFactory = transportFactory; self.confirmationTimeout = confirmationTimeout
     }
 
@@ -75,11 +78,12 @@ final class SessionCoordinator {
         let synthesizer = EventSynthesizer()
         let engine = AudioStreamEngine()
         let ax = AXEngineAdapter(synthesizer: synthesizer)
+        let kill = KillSwitchAdapter(playbackStop: { engine.stopPlaybackNow() })
         return SessionCoordinator(ledger: LedgerAdapter(), risk: RiskAdapter(),
                                   screenContext: ax, system: ax,
                                   overlay: OverlayAdapter(), gate: GateAdapter(),
                                   audio: AudioAdapter(engine: engine),
-                                  stopSignal: KillSwitchAdapter(playbackStop: { engine.stopPlaybackNow() }),
+                                  stopSignal: kill, killSwitch: kill,
                                   warmer: ax,
                                   transportFactory: liveTransportFactory())
     }()
@@ -105,7 +109,7 @@ final class SessionCoordinator {
                                                 from: Data(MockSession.demoScenarioJSON.utf8))
         if scenario.frames.indices.contains(2) {
             scenario.frames[2] = try JSONDecoder().decode([MockSession.Frame].self, from: Data(#"""
-            [{"afterMs":200,"json":"{\"toolCall\":{\"functionCalls\":[{\"id\":\"demo-fc-1\",\"name\":\"execute_action\",\"args\":{\"intent\":\"Delete my project notes\",\"action\":\"delete_target\",\"target\":\"Project\"}}]}}"}]
+            [{"afterMs":200,"json":"{\"toolCall\":{\"functionCalls\":[{\"id\":\"demo-fc-1\",\"name\":\"execute_action\",\"args\":{\"intent\":\"Delete my project note\",\"action\":\"delete_target\",\"target\":\"Project\"}}]}}"}]
             """#.utf8))[0]
         }
         let cancelBeat = try JSONDecoder().decode([MockSession.Frame].self, from: Data(#"""
@@ -144,6 +148,7 @@ final class SessionCoordinator {
         modelTurnActive = false
         let router = ToolRouter(ledger: ledger, risk: risk, screenContext: screenContext,
                                 system: system, overlay: overlay, gate: gate,
+                                killSwitch: killSwitch,
                                 confirmationTimeout: confirmationTimeout)
         self.router = router
         let live = GeminiLiveClient(
