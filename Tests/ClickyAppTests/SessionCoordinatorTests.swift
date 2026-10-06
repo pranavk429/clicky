@@ -124,6 +124,38 @@ actor TestStopSignal: StopSignalPort {
     func triggerBargeIn(onset: ContinuousClock.Instant) async {}
 }
 
+/// Records the stop reasons a `KillSwitchAdapter` delivers through `onStop`.
+actor StopRecorder {
+    private(set) var reasons: [StopReason] = []
+    func record(_ reason: StopReason) { reasons.append(reason) }
+    func waitForCount(_ count: Int, timeout: TimeInterval) async -> [StopReason] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while reasons.count < count && Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+        return reasons
+    }
+}
+
+/// Audio spy that records whether the stop-signal observer was already registered
+/// when `audio.start` ran (so a connect-window breaker escalation cannot be dropped).
+actor OrderingAudio: AudioSessionPort {
+    private let stopSignal: TestStopSignal
+    private(set) var stopRegisteredBeforeStart = false
+
+    init(stopSignal: TestStopSignal) { self.stopSignal = stopSignal }
+
+    func start(onFrame: @escaping @Sendable ([Int16]) -> Void,
+               onSpeechOnset: @escaping @Sendable (ContinuousClock.Instant) -> Void) async throws {
+        stopRegisteredBeforeStart = await stopSignal.starts >= 1
+    }
+    func stop() async {}
+    func beginPlaybackTurn() async {}
+    func enqueueModelAudio(_ base64Chunks: [String]) async {}
+    func stopPlaybackNow() async {}
+}
+
 @MainActor
 final class SessionCoordinatorTests: XCTestCase {
     func testMockDemoRoutesThroughRouterAndCancelsBeforeExecution() async throws {
@@ -222,8 +254,12 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.isRunning)
         let audioStarts = await audio.starts
         let signalStarts = await stopSignal.starts
+        let signalStops = await stopSignal.stops
         XCTAssertEqual(audioStarts, 0, "a superseded start must not start audio")
-        XCTAssertEqual(signalStarts, 0, "a superseded start must not register the kill switch")
+        // The stop observer is registered BEFORE live.start() (so a connect-window
+        // breaker escalation is never dropped); the superseding stop() tears it down.
+        XCTAssertEqual(signalStarts, 1, "the observer is registered early, before the client goes live")
+        XCTAssertEqual(signalStops, 1, "the superseding stop must tear the observer down")
 
         // The same coordinator starts cleanly afterwards.
         await coordinator.start()
@@ -231,9 +267,42 @@ final class SessionCoordinatorTests: XCTestCase {
         let audioStartsAfter = await audio.starts
         let signalStartsAfter = await stopSignal.starts
         XCTAssertEqual(audioStartsAfter, 1, "a fresh start installs audio exactly once")
-        XCTAssertEqual(signalStartsAfter, 1)
+        XCTAssertEqual(signalStartsAfter, 2, "the fresh start registers the observer again")
         await coordinator.stop(reason: .userToggle)
         XCTAssertFalse(coordinator.isRunning)
+    }
+
+    /// Issue 1: the stop observer must exist before the client can process a tool call,
+    /// so a breaker escalation in the connect window (after `live.start()`, before
+    /// `audio.start`) is never posted to nobody.
+    func testStopObserverRegisteredBeforeAudioStart() async throws {
+        let stopSignal = TestStopSignal()
+        let audio = OrderingAudio(stopSignal: stopSignal)
+        let mock = try MockSession(scenarioJSON: noopScenarioJSON, sleeper: ImmediateSleeper())
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: audio, stopSignal: stopSignal, transportFactory: { mock })
+
+        await coordinator.start()
+
+        let registered = await audio.stopRegisteredBeforeStart
+        XCTAssertTrue(registered,
+                      "the stop observer must be registered before audio starts, or a connect-window escalation is dropped")
+        await coordinator.stop(reason: .userToggle)
+    }
+
+    /// Issue 2: a prior voice barge-in latches the manager; a later breaker trip must
+    /// still deliver the session stop unconditionally.
+    func testBreakerEscalationDeliversAfterBargeInLatch() async throws {
+        let recorder = StopRecorder()
+        let adapter = KillSwitchAdapter(playbackStop: {}, releaseInput: {})
+        await adapter.start { reason in Task { await recorder.record(reason) } }
+        await adapter.triggerBargeIn(onset: ContinuousClock.now)   // latches the same manager
+        await adapter.triggerKillSwitch(source: "circuit_breaker")
+
+        let reasons = await recorder.waitForCount(1, timeout: 2)
+        XCTAssertEqual(reasons, [.killSwitch], "a breaker trip must not be swallowed by a prior barge-in latch")
     }
 
     /// An audio (or kill-switch) start failure surfaces a notice and tears the whole

@@ -163,6 +163,14 @@ final class SessionCoordinator {
             onNotice: { [weak self] text in Task { @MainActor in self?.onNotice?(text) } },
             onMarker: { [weak self] marker in Task { @MainActor in self?.onMarker?(marker) } })
         client = live
+        // Register the local stop observer and re-arm the latch BEFORE the client can
+        // process a tool call: a circuit-breaker escalation in the connect window must
+        // never be dropped just because audio/kill-switch start has not finished
+        // (spec §4.4). The observer is torn down on any start failure below.
+        await stopSignal.resetLatch()
+        await stopSignal.start { [weak self] reason in
+            Task { @MainActor in await self?.handleStopSignal(reason) }
+        }
         do {
             try await live.start()
         } catch {
@@ -170,6 +178,7 @@ final class SessionCoordinator {
             isRunning = false
             client = nil
             self.router = nil
+            await stopSignal.stop()
             onNotice?("Session could not start (\(error)).")
             return
         }
@@ -196,12 +205,6 @@ final class SessionCoordinator {
                     await self?.warmer?.speculateFrontmost()
                     await self?.stopSignal.triggerBargeIn(onset: onset)
                 }
-            }
-            guard isCurrent(generation) else { return }
-            await stopSignal.resetLatch()
-            guard isCurrent(generation) else { return }
-            await stopSignal.start { [weak self] reason in
-                Task { @MainActor in await self?.handleStopSignal(reason) }
             }
         } catch {
             guard isCurrent(generation) else { return }

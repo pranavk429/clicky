@@ -422,13 +422,18 @@ actor AudioAdapter: AudioSessionPort {
 /// that instance.
 actor KillSwitchAdapter: StopSignalPort, KillSwitchPort {
     private let manager: KillSwitchManager
+    private let playbackStop: @Sendable () -> Void
+    private let releaseInput: @Sendable () -> Void
     private var observer: NSObjectProtocol?
     private var onStop: (@Sendable (StopReason) -> Void)?
 
-    init(playbackStop: @escaping @Sendable () -> Void) {
+    init(playbackStop: @escaping @Sendable () -> Void,
+         releaseInput: @escaping @Sendable () -> Void = { KillSwitchManager.releaseSyntheticInputNow() }) {
+        self.playbackStop = playbackStop
+        self.releaseInput = releaseInput
         self.manager = KillSwitchManager(hooks: KillSwitchManager.Hooks(
             stopPlayback: playbackStop,
-            releaseSyntheticInput: { KillSwitchManager.releaseSyntheticInputNow() },
+            releaseSyntheticInput: releaseInput,
             presentBanner: { _ in },
             stopSession: {}))
     }
@@ -460,13 +465,15 @@ actor KillSwitchAdapter: StopSignalPort, KillSwitchPort {
     }
 
     /// `ToolRouter`'s circuit-breaker escalation port (spec §4.4): a latched breaker
-    /// asks the local kill switch to stop the session. Reuses this manager's hooks
-    /// (stop playback + release synthetic input) and its own notification observer,
-    /// which delivers the session stop. `KillSwitchManager.Source` has no breaker
-    /// case, so the hardware-path label `.hotKey` is used; nothing user-visible
-    /// depends on it (this adapter's banner hook is a no-op).
+    /// must stop the session. Delivered directly and unconditionally — it neither
+    /// consults the barge-in latch (a prior voice onset on the same manager must not
+    /// swallow the escalation) nor routes through the notification observer (which
+    /// may not be registered yet during the connect window). Playback and synthetic
+    /// input are released first, then the session stop is delivered.
     func triggerKillSwitch(source: String) async {
-        manager.triggerKillSwitch(source: .hotKey)
+        playbackStop()
+        releaseInput()
+        deliverStop()
     }
 
     private func deliverStop() {
