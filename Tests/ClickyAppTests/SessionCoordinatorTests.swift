@@ -74,10 +74,41 @@ actor TestGateBridge: ConfirmationGatingPort {
     func markPromptTurnComplete() async {}
 }
 
-struct TestAudio: AudioSessionPort {
+enum TestError: Error { case boom }
+
+/// Controllable async gate for the stop-during-start test: the transport factory
+/// parks on `wait()` until the test opens it.
+actor AsyncGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var opened = false
+    private(set) var waiters = 0
+
+    func wait() async {
+        if opened { return }
+        waiters += 1
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func waitForWaiter() async {
+        while waiters == 0 { await Task.yield() }
+    }
+    func open() { opened = true; continuation?.resume(); continuation = nil }
+}
+
+let noopScenarioJSON = #"{"name":"noop","frames":[{"afterMs":0,"json":"{\"setupComplete\":{}}"}]}"#
+
+actor SpyAudio: AudioSessionPort {
+    private(set) var starts = 0
+    private(set) var stops = 0
+    private let failOnStart: Bool
+
+    init(failOnStart: Bool = false) { self.failOnStart = failOnStart }
+
     func start(onFrame: @escaping @Sendable ([Int16]) -> Void,
-               onSpeechOnset: @escaping @Sendable (ContinuousClock.Instant) -> Void) async throws {}
-    func stop() async {}
+               onSpeechOnset: @escaping @Sendable (ContinuousClock.Instant) -> Void) async throws {
+        starts += 1
+        if failOnStart { throw TestError.boom }
+    }
+    func stop() async { stops += 1 }
     func beginPlaybackTurn() async {}
     func enqueueModelAudio(_ base64Chunks: [String]) async {}
     func stopPlaybackNow() async {}
@@ -85,8 +116,10 @@ struct TestAudio: AudioSessionPort {
 
 actor TestStopSignal: StopSignalPort {
     private(set) var resets = 0
-    func start(onStop: @escaping @Sendable (StopReason) -> Void) async {}
-    func stop() async {}
+    private(set) var starts = 0
+    private(set) var stops = 0
+    func start(onStop: @escaping @Sendable (StopReason) -> Void) async { starts += 1 }
+    func stop() async { stops += 1 }
     func resetLatch() async { resets += 1 }
     func triggerBargeIn(onset: ContinuousClock.Instant) async {}
 }
@@ -105,7 +138,7 @@ final class SessionCoordinatorTests: XCTestCase {
         let coordinator = SessionCoordinator(
             ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
             system: system, overlay: overlay, gate: gate,
-            audio: TestAudio(), stopSignal: TestStopSignal(), transportFactory: { mock })
+            audio: SpyAudio(), stopSignal: TestStopSignal(), transportFactory: { mock })
         await coordinator.start()
 
         let sent = await mock.waitForSent(count: 2, timeout: 6)   // setup + toolResponse
@@ -137,11 +170,93 @@ final class SessionCoordinatorTests: XCTestCase {
         let coordinator = SessionCoordinator(
             ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
             system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
-            audio: TestAudio(), stopSignal: stopSignal, transportFactory: { mock })
+            audio: SpyAudio(), stopSignal: stopSignal, transportFactory: { mock })
         await coordinator.start()
 
         let resets = await stopSignal.resets
         XCTAssertGreaterThanOrEqual(resets, 1, "session start must re-arm the latched kill switch")
         await coordinator.stop(reason: .userToggle)
+    }
+
+    /// start/stop is one state machine: a second stop must not re-enter teardown.
+    func testDoubleStopIsANoOp() async throws {
+        let audio = SpyAudio()
+        let stopSignal = TestStopSignal()
+        let mock = try MockSession(scenarioJSON: noopScenarioJSON, sleeper: ImmediateSleeper())
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: audio, stopSignal: stopSignal, transportFactory: { mock })
+        await coordinator.start()
+        XCTAssertTrue(coordinator.isRunning)
+
+        await coordinator.stop(reason: .userToggle)
+        await coordinator.stop(reason: .userToggle)   // second stop must be inert
+
+        let audioStops = await audio.stops
+        let signalStops = await stopSignal.stops
+        XCTAssertEqual(audioStops, 1, "teardown must run exactly once")
+        XCTAssertEqual(signalStops, 1)
+        XCTAssertFalse(coordinator.isRunning)
+    }
+
+    /// A stop() that lands while start() is parked in an await is authoritative: the
+    /// superseded start must install no audio/kill-switch state, and a later start
+    /// must work normally.
+    func testStopDuringStartTearsDownAndLaterStartWorks() async throws {
+        let gate = AsyncGate()
+        let audio = SpyAudio()
+        let stopSignal = TestStopSignal()
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: audio, stopSignal: stopSignal,
+            transportFactory: { await gate.wait(); return try MockSession(scenarioJSON: noopScenarioJSON, sleeper: ImmediateSleeper()) })
+
+        let startTask = Task { await coordinator.start() }
+        await gate.waitForWaiter()                     // start() is parked in the transport factory
+        await coordinator.stop(reason: .userToggle)    // stop wins the race
+        await gate.open()
+        await startTask.value
+
+        XCTAssertFalse(coordinator.isRunning)
+        let audioStarts = await audio.starts
+        let signalStarts = await stopSignal.starts
+        XCTAssertEqual(audioStarts, 0, "a superseded start must not start audio")
+        XCTAssertEqual(signalStarts, 0, "a superseded start must not register the kill switch")
+
+        // The same coordinator starts cleanly afterwards.
+        await coordinator.start()
+        XCTAssertTrue(coordinator.isRunning)
+        let audioStartsAfter = await audio.starts
+        let signalStartsAfter = await stopSignal.starts
+        XCTAssertEqual(audioStartsAfter, 1, "a fresh start installs audio exactly once")
+        XCTAssertEqual(signalStartsAfter, 1)
+        await coordinator.stop(reason: .userToggle)
+        XCTAssertFalse(coordinator.isRunning)
+    }
+
+    /// An audio (or kill-switch) start failure surfaces a notice and tears the whole
+    /// session down rather than leaving a half-started state.
+    func testAudioStartFailureNoticesAndTearsDown() async throws {
+        let audio = SpyAudio(failOnStart: true)
+        let stopSignal = TestStopSignal()
+        let mock = try MockSession(scenarioJSON: noopScenarioJSON, sleeper: ImmediateSleeper())
+        let coordinator = SessionCoordinator(
+            ledger: TestLedger(), risk: TestRisk(), screenContext: TestContext(),
+            system: TestSystemSpy(), overlay: TestOverlaySpy(), gate: TestGateBridge(),
+            audio: audio, stopSignal: stopSignal, transportFactory: { mock })
+        var notices: [String] = []
+        coordinator.onNotice = { notices.append($0) }
+
+        await coordinator.start()
+
+        XCTAssertFalse(coordinator.isRunning)
+        XCTAssertTrue(notices.contains { $0.contains("Audio or kill switch failed to start") },
+                      "a start failure must be surfaced")
+        let audioStops = await audio.stops
+        let signalStops = await stopSignal.stops
+        XCTAssertEqual(audioStops, 1, "the failure path must tear audio down")
+        XCTAssertEqual(signalStops, 1, "the failure path must tear the stop signal down")
     }
 }

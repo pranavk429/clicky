@@ -280,6 +280,10 @@ actor GateAdapter: ConfirmationGatingPort {
     private let gate: PendingActionGate
     private var pendingContinuation: CheckedContinuation<ConfirmationDecision, Never>?
     private var currentActionID: UUID?
+    /// The one live expiry timer for the current `pendingContinuation`. Cancelled and
+    /// replaced on every arm (and on resolution) so a superseding arm can never leave
+    /// a pending continuation without a timeout.
+    private var timeoutTask: Task<Void, Never>?
 
     init(gate: PendingActionGate = PendingActionGate()) {
         self.gate = gate
@@ -299,11 +303,15 @@ actor GateAdapter: ConfirmationGatingPort {
                 old.resume(returning: .cancelled(reason: "superseded"))
             } else {
                 self.pendingContinuation = continuation
-                let timeoutSeconds = max(request.timeoutSeconds, PendingActionGate.minimumTimeout)
-                Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64((timeoutSeconds + 2) * 1_000_000_000))
-                    await self?.handleTimeout(for: request.actionID)
-                }
+            }
+            // Every arm owns exactly one live timeout: the superseded continuation was
+            // just resumed, so cancel its timer and start one for the new continuation.
+            self.timeoutTask?.cancel()
+            let timeoutSeconds = max(request.timeoutSeconds, PendingActionGate.minimumTimeout)
+            self.timeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64((timeoutSeconds + 2) * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                await self?.handleTimeout(for: request.actionID)
             }
         }
     }
@@ -345,6 +353,8 @@ actor GateAdapter: ConfirmationGatingPort {
         if let cont = pendingContinuation {
             pendingContinuation = nil
             currentActionID = nil
+            timeoutTask?.cancel()
+            timeoutTask = nil
             cont.resume(returning: decision)
         }
     }

@@ -50,6 +50,7 @@ final class SessionCoordinator {
     var onNotice: ((String) -> Void)?
     var onMarker: ((GeminiMarker) -> Void)?
     private(set) var isRunning = false
+    private var startGeneration = 0
     private var client: GeminiLiveClient?
     private var router: ToolRouter?
     private var modelTurnActive = false
@@ -134,6 +135,12 @@ final class SessionCoordinator {
     func start() async {
         guard !isRunning else { return }
         isRunning = true
+        // A start generation token makes a stop() that lands during any of the
+        // awaits below authoritative: the superseded start returns without
+        // installing audio/kill-switch state, and the stop() has already torn
+        // down whatever this start managed to install before the await.
+        startGeneration &+= 1
+        let generation = startGeneration
         modelTurnActive = false
         let router = ToolRouter(ledger: ledger, risk: risk, screenContext: screenContext,
                                 system: system, overlay: overlay, gate: gate,
@@ -154,13 +161,16 @@ final class SessionCoordinator {
         do {
             try await live.start()
         } catch {
+            guard isCurrent(generation) else { return }
             isRunning = false
             client = nil
             self.router = nil
             onNotice?("Session could not start (\(error)).")
             return
         }
+        guard isCurrent(generation) else { return }
         await warmer?.warmFrontmostWindow()
+        guard isCurrent(generation) else { return }
         do {
             // Ordered bridge from the engine's serial processing queue to the client
             // actor: `onInputChunk` is synchronous, so an AsyncStream preserves the
@@ -182,15 +192,22 @@ final class SessionCoordinator {
                     await self?.stopSignal.triggerBargeIn(onset: onset)
                 }
             }
+            guard isCurrent(generation) else { return }
             await stopSignal.resetLatch()
+            guard isCurrent(generation) else { return }
             await stopSignal.start { [weak self] reason in
                 Task { @MainActor in await self?.handleStopSignal(reason) }
             }
         } catch {
+            guard isCurrent(generation) else { return }
             onNotice?("Audio or kill switch failed to start (\(error)).")
             await stop(reason: .userToggle)
         }
     }
+
+    /// True only while this start attempt is still the live session (not superseded
+    /// by a stop() during an await).
+    private func isCurrent(_ generation: Int) -> Bool { isRunning && generation == startGeneration }
 
     func stop(reason: StopReason) async {
         guard isRunning else { return }
