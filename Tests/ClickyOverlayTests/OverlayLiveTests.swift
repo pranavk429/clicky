@@ -27,6 +27,7 @@ final class OverlayLiveTests: XCTestCase {
     func testOnePanelPerScreenWithLiveWindowIDs() throws {
         let controller = try requireLiveOverlay()
         defer { controller.stop() }
+        XCTAssertFalse(NSScreen.screens.isEmpty, "no active displays — panel count would match vacuously (0 == 0)")
         XCTAssertEqual(controller.panelWindowIDs.count, NSScreen.screens.count)
         XCTAssertTrue(controller.panelWindowIDs.allSatisfy { $0 != 0 }, "panels must be on screen to have CGWindowIDs")
     }
@@ -34,12 +35,15 @@ final class OverlayLiveTests: XCTestCase {
     func testLiveStateCycle() throws {
         let controller = try requireLiveOverlay()
         defer { controller.stop() }
+        defer { controller.onCardAction = nil }
         controller.onCardAction = { [weak controller] action in
             controller?.present(.stopped(reason: action == .confirm ? "card confirm" : "card cancel"))
         }
         let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.maxY ?? 0
         let cgFrames = NSScreen.screens.map { CoordinateMath.cgFrame(fromAppKit: $0.frame, primaryHeight: primaryHeight) }
-        let primary = cgFrames[0]
+        guard let primary = cgFrames.first else {
+            throw XCTSkip("no active displays")
+        }
         controller.present(.moving(to: CGPoint(x: primary.midX, y: primary.midY)))
         pause(4)
         for frame in cgFrames {   // multi-display: one review box per screen in turn
@@ -67,6 +71,9 @@ final class OverlayLiveTests: XCTestCase {
         }
         let overlayIDs = Set(controller.panelWindowIDs)
         let shareableIDs = Set(content.windows.map(\.windowID))
+        XCTAssertFalse(overlayIDs.isEmpty, "overlay panels must exist to prove exclusion")
+        XCTAssertFalse(overlayIDs.contains(0), "panels must be on screen to have CGWindowIDs")
+        XCTAssertFalse(shareableIDs.isEmpty, "shareable window list is empty — exclusion would pass vacuously")
         XCTAssertTrue(overlayIDs.isDisjoint(with: shareableIDs),
                       "overlay panels must never be shareable: \(overlayIDs.intersection(shareableIDs))")
     }
