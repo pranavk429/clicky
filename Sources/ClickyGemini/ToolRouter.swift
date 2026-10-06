@@ -207,6 +207,16 @@ public actor ToolRouter: GeminiToolHandling {
         }
     }
 
+    /// Starts a new turn: replenishes the per-turn action budget and forgets the
+    /// tool-call ids seen so far, so a `turnComplete` (Chunk 13 wiring) cannot
+    /// inherit the previous turn's spent budget or duplicate ids. The temporal
+    /// rate-limit clock, the failure streak and the breaker latch are
+    /// deliberately preserved — they are not turn-scoped.
+    public func beginTurn() {
+        actionCount = 0
+        processedCallIDs.removeAll()
+    }
+
     // MARK: execute_action
 
     private func executeAction(_ call: GeminiToolCall.FunctionCall) async -> GeminiToolHandlerResult {
@@ -219,7 +229,7 @@ public actor ToolRouter: GeminiToolHandling {
         }
         // T10 (spec §4.4): only the user's voice creates intents; a poisoned page
         // cannot authorize anything even if it drives the model to call this tool.
-        guard await ledger.isTraceableToVoiceIntent(intent, at: Date()) else {
+        guard await ledger.isTraceableToVoiceIntent(intent, at: now()) else {
             await overlay.present(.stopped(reason: "Refused — not from your voice"))
             return Self.result(status: "not_authorized", detail: "no matching voice intent", scheduling: .interrupted)
         }
@@ -234,7 +244,6 @@ public actor ToolRouter: GeminiToolHandling {
             return Self.result(status: "budget_exceeded",
                                detail: "the per-turn action budget of \(actionBudget) is spent", scheduling: .interrupted)
         }
-        actionCount += 1
         if processedCallIDs.contains(call.id) {
             return Self.result(status: "duplicate",
                                detail: "tool-call id '\(call.id)' was already processed this turn", scheduling: .interrupted)
@@ -245,6 +254,9 @@ public actor ToolRouter: GeminiToolHandling {
             return Self.result(status: "rate_limited",
                                detail: "actions are limited to one every \(minActionInterval) s", scheduling: .interrupted)
         }
+        // Accepted for dispatch: only a call that survives every rejection
+        // check consumes the per-turn budget.
+        actionCount += 1
         processedCallIDs.insert(call.id)
         lastActionDate = dispatchDate
         let targetText = Self.stringArg(call.args, "target")
@@ -393,11 +405,12 @@ public actor ToolRouter: GeminiToolHandling {
 
     // MARK: Helpers
 
-    /// Bumps the failure streak and, once it reaches the threshold, latches the
-    /// circuit breaker and escalates to the local kill switch (spec §4.4).
+    /// Bumps the failure streak and, on the single transition to the tripped
+    /// state, latches the circuit breaker and escalates to the local kill switch
+    /// (spec §4.4). An already-latched breaker never re-triggers the switch.
     private func recordFailure() async {
         consecutiveFailures += 1
-        guard consecutiveFailures >= failureThreshold else { return }
+        guard consecutiveFailures >= failureThreshold, !isCircuitBreakerTripped else { return }
         isCircuitBreakerTripped = true
         await killSwitch?.triggerKillSwitch(source: "circuit_breaker")
     }

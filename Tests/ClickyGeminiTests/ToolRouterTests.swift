@@ -236,16 +236,37 @@ final class TimeBox: @unchecked Sendable {
 }
 extension ToolRouterTests {
     func testPerTurnActionBudgetEnforced() async throws {
+        let system = SystemSpy(resolutions: [makeTarget(), makeTarget(), makeTarget()])
         let router = ToolRouter(ledger: LedgerSpy(allowed: true), risk: RiskStub(tier: .reversible),
                                 screenContext: ContextStub(snapshot: ScreenContext(applicationName: "A", windowTitle: "W", elements: [])),
-                                system: SystemSpy(resolutions: [makeTarget(), makeTarget(), makeTarget()]),
+                                system: system,
                                 overlay: OverlaySpy(), gate: GateScript(decision: .confirmed(source: .voiceTranscript)),
                                 sleeper: ImmediateSleeper(), actionBudget: 2)
-        _ = try await router.execute(makeCall(ClickyTools.executeAction, ["intent": .string("t"), "action": .string("click")]))
-        _ = try await router.execute(makeCall(ClickyTools.executeAction, ["intent": .string("t"), "action": .string("click")]))
-        let third = try await router.execute(makeCall(ClickyTools.executeAction, ["intent": .string("t"), "action": .string("click")]))
+        let first = try await router.execute(GeminiToolCall.FunctionCall(id: "b1", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(first, "status"), "executed")
+        let second = try await router.execute(GeminiToolCall.FunctionCall(id: "b2", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(second, "status"), "executed")
+        let third = try await router.execute(GeminiToolCall.FunctionCall(id: "b3", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
         XCTAssertEqual(stringField(third, "status"), "budget_exceeded")
         XCTAssertEqual(third.scheduling, .interrupted)
+        let performs = await system.performs.count
+        XCTAssertEqual(performs, 2)
+    }
+    func testBeginTurnReplenishesBudgetAndClearsCallIDs() async throws {
+        let system = SystemSpy(resolutions: [makeTarget(), makeTarget()])
+        let router = ToolRouter(ledger: LedgerSpy(allowed: true), risk: RiskStub(tier: .reversible),
+                                screenContext: ContextStub(snapshot: ScreenContext(applicationName: "A", windowTitle: "W", elements: [])),
+                                system: system,
+                                overlay: OverlaySpy(), gate: GateScript(decision: .confirmed(source: .voiceTranscript)),
+                                sleeper: ImmediateSleeper(), actionBudget: 1)
+        let call = GeminiToolCall.FunctionCall(id: "turn-1", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")])
+        let first = try await router.execute(call)
+        XCTAssertEqual(stringField(first, "status"), "executed")
+        let overBudget = try await router.execute(GeminiToolCall.FunctionCall(id: "turn-2", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(overBudget, "status"), "budget_exceeded")
+        await router.beginTurn()
+        let replayed = try await router.execute(call)
+        XCTAssertEqual(stringField(replayed, "status"), "executed", "a new turn replenishes budget and forgets prior call ids")
     }
     func testDuplicateToolCallIDIsDeduplicated() async throws {
         let fixture = makeFixture()
@@ -290,5 +311,8 @@ extension ToolRouterTests {
         XCTAssertEqual(postTrip.scheduling, .interrupted)
         let performCount = await failingSystem.performCount
         XCTAssertEqual(performCount, 2)
+        // An extra failure attempt while already latched must not re-trigger the kill switch.
+        let triggersAfter = await killSpy.triggers
+        XCTAssertEqual(triggersAfter, ["circuit_breaker"])
     }
 }
