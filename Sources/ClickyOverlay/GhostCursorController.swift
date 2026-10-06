@@ -11,7 +11,7 @@ import AppKit
 @MainActor
 public final class GhostCursorController {
     private let panel: NSPanel
-    private let ghostView: GhostCursorView
+    private let ghostView: DemoGhostCursorCanvasView
     private let screenOrigin: CGPoint
 
     private var confirmationTimer: Timer?
@@ -23,7 +23,7 @@ public final class GhostCursorController {
         let screen = NSScreen.screens.first ?? NSScreen.main
         let screenFrame = screen?.frame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
 
-        let view = GhostCursorView(frame: CGRect(origin: .zero, size: screenFrame.size))
+        let view = DemoGhostCursorCanvasView(frame: CGRect(origin: .zero, size: screenFrame.size))
         view.autoresizingMask = [.width, .height]
         view.cursorPoint = CGPoint(x: screenFrame.width / 2, y: screenFrame.height / 2)
 
@@ -188,7 +188,7 @@ public enum GhostEasing {
 /// Single non-flipped view that draws every ghost-cursor element in panel-local
 /// coordinates. Being non-flipped (`isFlipped == false`, the AppKit default) keeps
 /// panel-local y-up coordinates aligned directly with AppKit global screen points.
-private final class GhostCursorView: NSView {
+private final class DemoGhostCursorCanvasView: NSView {
     var cursorPoint: CGPoint = .zero
     var intentText: String?
     var confirmationText: String?
@@ -228,7 +228,7 @@ private final class GhostCursorView: NSView {
         NSColor.systemBlue.withAlphaComponent(0.2).setFill()
         NSBezierPath(ovalIn: haloRect).fill()
 
-        let points = GhostCursorView.pointerPoints
+        let points = DemoGhostCursorCanvasView.pointerPoints
         let path = NSBezierPath()
         path.move(to: CGPoint(x: cursorPoint.x + points[0].x, y: cursorPoint.y + points[0].y))
         for point in points.dropFirst() {

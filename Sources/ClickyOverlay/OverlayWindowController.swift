@@ -1,6 +1,7 @@
 import AppKit
 import ClickyCore
 import Foundation
+import SwiftUI
 
 /// Commands the rest of the app sends to the overlay — the interface contract
 /// for the integration chunks (spec §4.3). Geometry is global CoreGraphics:
@@ -102,5 +103,166 @@ enum OverlayPlacementResolver {
     private static func stopScreen(in screens: [DisplayGeometry], lastActiveScreenID: UInt32?) -> DisplayGeometry? {
         if let lastActiveScreenID, let screen = screens.first(where: { $0.id == lastActiveScreenID }) { return screen }
         return screens.first
+    }
+}
+
+/// One borderless panel per screen. The glass-wall invariant (spec §4.3;
+/// report 03 time-sink #5): `ignoresMouseEvents` is set ONCE here, in `init`,
+/// and no other line in this module may touch it — flipping it mid-run makes
+/// every click on the Mac land on the overlay. `canBecomeKey`/`canBecomeMain`
+/// are permanently false so the overlay never steals focus.
+final class OverlayPanel: NSPanel {
+    init(screen: NSScreen) {
+        super.init(contentRect: screen.frame,
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered,
+                   defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        level = .screenSaver
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        hidesOnDeactivate = false
+        ignoresMouseEvents = true          // set once — the glass wall
+        isMovable = false
+        isReleasedWhenClosed = false
+        animationBehavior = .none
+        sharingType = .none                // keeps legacy captures clean too
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Owns the per-screen panels. Spec §4.3: `start()` pre-creates them at launch
+/// and rebuilds on display changes (lazy creation adds 50–200 ms and breaks the
+/// execution-leg budget); the first `present` is a documented safety net for a
+/// missing launch call only — a no-op once the panels exist.
+@MainActor
+public final class OverlayWindowController {
+    public static let shared = OverlayWindowController()
+
+    /// CGWindowIDs of the live panels. The vision path reads this at capture
+    /// time and excludes the panels from ScreenCaptureKit (errata B11).
+    public private(set) var panelWindowIDs: [CGWindowID] = []
+
+    /// Wired by the integration layer to the pending-action gate.
+    public var onCardAction: ((OverlayCardAction) -> Void)?
+
+    private let model = OverlayViewModel()
+    private var panels: [PanelRecord] = []
+    private var lastActiveScreenID: UInt32?
+    private var screenObserver: NSObjectProtocol?
+
+    private struct PanelRecord {
+        let geometry: DisplayGeometry
+        let panel: OverlayPanel
+    }
+
+    private init() {}
+
+    /// Creates/orders the panels and starts observing screen changes. Call once
+    /// at app launch (spec §4.3 pre-creation). Idempotent: the first `present`
+    /// also starts defensively when the integration missed this call.
+    public func start() {
+        guard panels.isEmpty else { return }
+        rebuildPanels()
+        if screenObserver == nil {
+            screenObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.rebuildPanels() }
+            }
+        }
+    }
+
+    public func stop() {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
+        }
+        for record in panels { record.panel.orderOut(nil) }
+        panels = []
+        panelWindowIDs = []
+        lastActiveScreenID = nil
+        model.presentations = [:]
+    }
+
+    /// Interface contract for the integration chunks: present each state at a
+    /// global CG point/rect; `.hidden` clears every panel. Starts the overlay
+    /// if `start()` was never called (no-op on the demo path).
+    public func present(_ command: OverlayCommand) {
+        start()
+        let presentations = OverlayPlacementResolver.resolve(command,
+                                                             screens: panels.map(\.geometry),
+                                                             lastActiveScreenID: lastActiveScreenID)
+        model.presentations = Dictionary(uniqueKeysWithValues: presentations.map { ($0.screenID, $0) })
+        guard let first = presentations.first else { return }
+        switch first.state {
+        case .confirm:
+            announce(first.accessibilityText, onScreen: first.screenID)
+            lastActiveScreenID = first.screenID
+        case .stopped:
+            announce(first.accessibilityText, onScreen: first.screenID)
+        case .moving, .review:
+            lastActiveScreenID = first.screenID
+        }
+    }
+
+    /// Integration convenience API — the exact entry points the Chunk 13
+    /// `OverlayAdapter` calls; all funnel into `present(_:)`.
+    public func presentMoving(at point: CGPoint) { present(.moving(to: point)) }
+    public func presentReview(rect: CGRect, label: String) { present(.review(rect: rect, label: label)) }
+    public func presentConfirmation(rect: CGRect, label: String) {
+        present(.confirm(rect: rect, point: CGPoint(x: rect.midX, y: rect.midY), prompt: label))
+    }
+    public func presentStopped(reason: String) { present(.stopped(reason: reason)) }
+
+    private func rebuildPanels() {
+        for record in panels { record.panel.orderOut(nil) }
+        model.presentations = [:]
+        let primaryHeight = Self.primaryHeight()
+        panels = NSScreen.screens.map { screen in
+            let geometry = DisplayGeometry.from(screen: screen, primaryHeight: primaryHeight)
+            let panel = OverlayPanel(screen: screen)
+            let hosting = NSHostingView(rootView: GhostCursorView(
+                model: model,
+                screenID: geometry.id,
+                onCardAction: { [weak self] action in self?.onCardAction?(action) }))
+            hosting.frame = CGRect(origin: .zero, size: screen.frame.size)
+            panel.contentView = hosting
+            panel.orderFrontRegardless()
+            return PanelRecord(geometry: geometry, panel: panel)
+        }
+        panelWindowIDs = panels.map { CGWindowID($0.panel.windowNumber) }
+    }
+
+    /// VoiceOver announcement so the prompt reaches users even though the panel
+    /// never becomes key (spec §4.3: the card is VoiceOver-readable).
+    private func announce(_ text: String?, onScreen screenID: UInt32) {
+        guard let text,
+              let element = panels.first(where: { $0.geometry.id == screenID })?.panel.contentView else { return }
+        NSAccessibility.post(element: element, notification: .announcementRequested,
+                             userInfo: [.announcement: text,
+                                        .priority: NSAccessibilityPriorityLevel.high.rawValue])
+    }
+
+    /// AppKit → CG flip anchor: the primary screen (origin {0,0}) supplies the
+    /// height for `CoordinateMath.cgFrame(fromAppKit:primaryHeight:)`.
+    private static func primaryHeight() -> CGFloat {
+        (NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.screens.first)?.frame.maxY ?? 0
+    }
+}
+
+extension DisplayGeometry {
+    /// Bridges an `NSScreen` into the coordinate model shared with AX, CGEvent
+    /// and ScreenCaptureKit. `NSScreenNumber` is the `CGDirectDisplayID`.
+    static func from(screen: NSScreen, primaryHeight: CGFloat) -> DisplayGeometry {
+        let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        return DisplayGeometry(id: number?.uint32Value ?? 0,
+                               cgFrame: CoordinateMath.cgFrame(fromAppKit: screen.frame, primaryHeight: primaryHeight),
+                               appKitFrame: screen.frame,
+                               scaleFactor: screen.backingScaleFactor)
     }
 }
