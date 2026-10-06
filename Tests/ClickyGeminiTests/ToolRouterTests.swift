@@ -218,3 +218,77 @@ final class ToolRouterTests: XCTestCase {
         XCTAssertEqual(resolves, 0, "context is read-only")
     }
 }
+
+actor KillSwitchSpy: KillSwitchPort {
+    private(set) var triggers: [String] = []
+    func triggerKillSwitch(source: String) async { triggers.append(source) }
+}
+actor FailingSystemSpy: SystemActionPort {
+    private(set) var performCount = 0
+    func resolve(title: String?, kind: ClickyActionKind) async -> ResolvedTarget? { makeTarget() }
+    func perform(_ action: ResolvedAction) async -> ActionOutcome {
+        performCount += 1
+        return .failed(reason: "hardware unavailable")
+    }
+}
+final class TimeBox: @unchecked Sendable {
+    var now: Date; init(_ now: Date = Date()) { self.now = now }
+}
+extension ToolRouterTests {
+    func testPerTurnActionBudgetEnforced() async throws {
+        let router = ToolRouter(ledger: LedgerSpy(allowed: true), risk: RiskStub(tier: .reversible),
+                                screenContext: ContextStub(snapshot: ScreenContext(applicationName: "A", windowTitle: "W", elements: [])),
+                                system: SystemSpy(resolutions: [makeTarget(), makeTarget(), makeTarget()]),
+                                overlay: OverlaySpy(), gate: GateScript(decision: .confirmed(source: .voiceTranscript)),
+                                sleeper: ImmediateSleeper(), actionBudget: 2)
+        _ = try await router.execute(makeCall(ClickyTools.executeAction, ["intent": .string("t"), "action": .string("click")]))
+        _ = try await router.execute(makeCall(ClickyTools.executeAction, ["intent": .string("t"), "action": .string("click")]))
+        let third = try await router.execute(makeCall(ClickyTools.executeAction, ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(third, "status"), "budget_exceeded")
+        XCTAssertEqual(third.scheduling, .interrupted)
+    }
+    func testDuplicateToolCallIDIsDeduplicated() async throws {
+        let fixture = makeFixture()
+        let call = GeminiToolCall.FunctionCall(id: "call-dup", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")])
+        let first = try await fixture.router.execute(call)
+        XCTAssertEqual(stringField(first, "status"), "executed")
+        let dup = try await fixture.router.execute(call)
+        XCTAssertEqual(stringField(dup, "status"), "duplicate")
+        XCTAssertEqual(dup.scheduling, .interrupted)
+        let performs = await fixture.system.performs.count
+        XCTAssertEqual(performs, 1)
+    }
+    func testActionRateLimitingThrottlesRapidDispatches() async throws {
+        let box = TimeBox(Date(timeIntervalSince1970: 1000))
+        let router = ToolRouter(ledger: LedgerSpy(allowed: true), risk: RiskStub(tier: .reversible),
+                                screenContext: ContextStub(snapshot: ScreenContext(applicationName: "A", windowTitle: "W", elements: [])),
+                                system: SystemSpy(resolutions: [makeTarget(), makeTarget()]),
+                                overlay: OverlaySpy(), gate: GateScript(decision: .confirmed(source: .voiceTranscript)),
+                                sleeper: ImmediateSleeper(), minActionInterval: 0.2, now: { box.now })
+        let first = try await router.execute(GeminiToolCall.FunctionCall(id: "r1", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(first, "status"), "executed")
+        let rapid = try await router.execute(GeminiToolCall.FunctionCall(id: "r2", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(rapid, "status"), "rate_limited")
+        box.now = box.now.addingTimeInterval(0.25)
+        let ok = try await router.execute(GeminiToolCall.FunctionCall(id: "r3", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(ok, "status"), "executed")
+    }
+    func testCircuitBreakerTripsAndEscalatesToKillSwitch() async throws {
+        let killSpy = KillSwitchSpy()
+        let failingSystem = FailingSystemSpy()
+        let router = ToolRouter(ledger: LedgerSpy(allowed: true), risk: RiskStub(tier: .reversible),
+                                screenContext: ContextStub(snapshot: ScreenContext(applicationName: "A", windowTitle: "W", elements: [])),
+                                system: failingSystem, overlay: OverlaySpy(),
+                                gate: GateScript(decision: .confirmed(source: .voiceTranscript)),
+                                sleeper: ImmediateSleeper(), failureThreshold: 2, killSwitch: killSpy)
+        _ = try await router.execute(GeminiToolCall.FunctionCall(id: "f1", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        _ = try await router.execute(GeminiToolCall.FunctionCall(id: "f2", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        let triggers = await killSpy.triggers
+        XCTAssertEqual(triggers, ["circuit_breaker"])
+        let postTrip = try await router.execute(GeminiToolCall.FunctionCall(id: "f3", name: ClickyTools.executeAction, args: ["intent": .string("t"), "action": .string("click")]))
+        XCTAssertEqual(stringField(postTrip, "status"), "circuit_breaker_tripped")
+        XCTAssertEqual(postTrip.scheduling, .interrupted)
+        let performCount = await failingSystem.performCount
+        XCTAssertEqual(performCount, 2)
+    }
+}

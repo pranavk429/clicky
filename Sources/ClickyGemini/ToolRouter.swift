@@ -143,6 +143,12 @@ public protocol ConfirmationGatingPort: Sendable {
     func markPromptTurnComplete() async
 }
 
+/// The local stop path (Chunk 9). Escalated to when the repeated-failure
+/// circuit breaker latches; optional so the router runs without it in tests.
+public protocol KillSwitchPort: Sendable {
+    func triggerKillSwitch(source: String) async
+}
+
 // MARK: - Router
 
 public actor ToolRouter: GeminiToolHandling {
@@ -159,15 +165,36 @@ public actor ToolRouter: GeminiToolHandling {
     private let gate: any ConfirmationGatingPort
     private let sleeper: any SleepProviding
     private let confirmationTimeout: TimeInterval
+    private let actionBudget: Int
+    private let minActionInterval: TimeInterval
+    private let failureThreshold: Int
+    private let killSwitch: (any KillSwitchPort)?
+    private let now: @Sendable () -> Date
+
+    // Runaway-protection state (spec §4.4): the per-turn dispatch count, the
+    // tool-call ids already seen, the last dispatch time, the failure streak
+    // and the latch that escalates to the kill switch.
+    private var actionCount = 0
+    private var processedCallIDs: Set<String> = []
+    private var lastActionDate: Date?
+    private var consecutiveFailures = 0
+    private var isCircuitBreakerTripped = false
 
     public init(ledger: any IntentLedgerPort, risk: any RiskClassifyingPort,
                 screenContext: any ScreenContextProviding, system: any SystemActionPort,
                 overlay: any GhostCursorPort, gate: any ConfirmationGatingPort,
                 sleeper: any SleepProviding = RealSleeper(),
+                actionBudget: Int = 10,
+                minActionInterval: TimeInterval = 0,
+                now: @escaping @Sendable () -> Date = { Date() },
+                failureThreshold: Int = 3,
+                killSwitch: (any KillSwitchPort)? = nil,
                 confirmationTimeout: TimeInterval = ToolRouter.defaultConfirmationTimeout) {
         self.ledger = ledger; self.risk = risk; self.screenContext = screenContext
         self.system = system; self.overlay = overlay; self.gate = gate
         self.sleeper = sleeper; self.confirmationTimeout = confirmationTimeout
+        self.actionBudget = actionBudget; self.minActionInterval = minActionInterval
+        self.now = now; self.failureThreshold = failureThreshold; self.killSwitch = killSwitch
     }
 
     public func execute(_ call: GeminiToolCall.FunctionCall) async throws -> GeminiToolHandlerResult {
@@ -196,6 +223,30 @@ public actor ToolRouter: GeminiToolHandling {
             await overlay.present(.stopped(reason: "Refused — not from your voice"))
             return Self.result(status: "not_authorized", detail: "no matching voice intent", scheduling: .interrupted)
         }
+        // Runaway protection (spec §4.4): a latched circuit breaker, an exhausted
+        // per-turn budget, a repeated tool-call id, or a too-rapid dispatch all
+        // fail closed before any OS work.
+        if isCircuitBreakerTripped {
+            return Self.result(status: "circuit_breaker_tripped",
+                               detail: "the repeated-failure circuit breaker is latched", scheduling: .interrupted)
+        }
+        if actionCount >= actionBudget {
+            return Self.result(status: "budget_exceeded",
+                               detail: "the per-turn action budget of \(actionBudget) is spent", scheduling: .interrupted)
+        }
+        actionCount += 1
+        if processedCallIDs.contains(call.id) {
+            return Self.result(status: "duplicate",
+                               detail: "tool-call id '\(call.id)' was already processed this turn", scheduling: .interrupted)
+        }
+        let dispatchDate = now()
+        if minActionInterval > 0, let last = lastActionDate,
+           dispatchDate.timeIntervalSince(last) < minActionInterval {
+            return Self.result(status: "rate_limited",
+                               detail: "actions are limited to one every \(minActionInterval) s", scheduling: .interrupted)
+        }
+        processedCallIDs.insert(call.id)
+        lastActionDate = dispatchDate
         let targetText = Self.stringArg(call.args, "target")
         let text = Self.stringArg(call.args, "text")
         let amount = Self.stringArg(call.args, "amount")
@@ -232,9 +283,11 @@ public actor ToolRouter: GeminiToolHandling {
         }
         switch await system.perform(action) {
         case .performed(let detail):
+            consecutiveFailures = 0
             return Self.result(status: "executed", detail: detail,
                                scheduling: tier >= .reversible ? .whenIdle : .silent)
         case .failed(let reason):
+            await recordFailure()
             await overlay.present(.stopped(reason: "Failed — \(reason)"))
             return Self.result(status: "failed", detail: reason, scheduling: .interrupted)
         case .refused(let reason):
@@ -288,8 +341,10 @@ public actor ToolRouter: GeminiToolHandling {
         }
         switch await system.perform(action) {
         case .performed(let detail):
+            consecutiveFailures = 0
             return Self.result(status: "executed", detail: detail, scheduling: .whenIdle)
         case .failed(let reason):
+            await recordFailure()
             await overlay.present(.stopped(reason: "Failed — \(reason)"))
             return Self.result(status: "failed", detail: reason, scheduling: .interrupted)
         case .refused(let reason):
@@ -337,6 +392,15 @@ public actor ToolRouter: GeminiToolHandling {
     }
 
     // MARK: Helpers
+
+    /// Bumps the failure streak and, once it reaches the threshold, latches the
+    /// circuit breaker and escalates to the local kill switch (spec §4.4).
+    private func recordFailure() async {
+        consecutiveFailures += 1
+        guard consecutiveFailures >= failureThreshold else { return }
+        isCircuitBreakerTripped = true
+        await killSwitch?.triggerKillSwitch(source: "circuit_breaker")
+    }
 
     private func summary(for action: ResolvedAction) -> String {
         let name = action.target?.displayName ?? action.text ?? ""
