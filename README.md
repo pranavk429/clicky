@@ -19,7 +19,7 @@ Speak naturally in English, Hindi, or Marathi — Clicky shows you what it will 
 
 ---
 
-> **Project status (2026-10-06): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunks 1–10 have landed: the package graph + tested foundation math; the menu-bar shell with the permission wizard and signed `.app` bundle; the Gemini wire-protocol layer with byte-exact offline fixtures and the transport seam; the Gemini Live client core with `setupComplete` gating, non-blocking tool dispatch, fail-closed cancellation, and hybrid-VAD end-of-speech; Gemini resilience — resumable session caching, `goAway`/transport-loss reconnect with backoff and fresh-session fallback, local mock mode replaying the demo scenario through the real dispatch path, and the day-0 live API spike; the Accessibility engine (budgeted crawler, hot cache, app adapters); input synthesis (Unicode-safe keystrokes, panic release); the 5-tier safety gates; audio capture + the energy-onset local stop; and the VoiceProcessingIO audio engine with 20 ms PCM chunks, adaptive jitter buffer, `⌘⇧X` kill switch and the in-app audio self-test. `swift build`, `swift test`, and `./scripts/doctor.sh` are green. First on-device measurements (2026-10-06, macOS 27.0.1, signed `.app`): the local stop fired **45.9–84.7 ms from the VAD onset** across runs (target <150 ms), and VPIO delivers 100 ms tap buffers on this OS. Every other performance number in this README remains an **architecture target** until the on-screen meter lands (Chunk 14).
+> **Project status (2026-10-06): pre-alpha.** The system design is complete and has survived five independent research/validation passes. Implementation is under way in reviewed chunks — Chunks 1–11 have landed: the package graph + tested foundation math; the menu-bar shell with the permission wizard and signed `.app` bundle; the Gemini wire-protocol layer with byte-exact offline fixtures and the transport seam; the Gemini Live client core with `setupComplete` gating, non-blocking tool dispatch, fail-closed cancellation, and hybrid-VAD end-of-speech; Gemini resilience — resumable session caching, `goAway`/transport-loss reconnect with backoff and fresh-session fallback, local mock mode replaying the demo scenario through the real dispatch path, and the day-0 live API spike; the Accessibility engine (budgeted crawler, hot cache, app adapters); input synthesis (Unicode-safe keystrokes, panic release); the 5-tier safety gates; audio capture + the energy-onset local stop; and the VoiceProcessingIO audio engine with 20 ms PCM chunks, adaptive jitter buffer, `⌘⇧X` kill switch and the in-app audio self-test; and the Ghost Cursor overlay — one pre-created `.screenSaver`-level, click-through `NSPanel` per screen (rebuilt on display changes), capture-excluded by `CGWindowID`, with a pure unit-tested state → visual model (moving blue pointer, review amber box, pulsing red confirm box with the pointer resting on the target, green stopped banner) and a VoiceOver-readable confirmation card whose Confirm/Cancel are separate accessibility elements. `swift build`, `swift test`, and `./scripts/doctor.sh` are green. First on-device measurements (2026-10-06, macOS 27.0.1, signed `.app`): the local stop fired **45.9–84.7 ms from the VAD onset** across runs (target <150 ms), and VPIO delivers 100 ms tap buffers on this OS. The overlay adds **no** measured timing: the spec's first-frame **≤16 ms** figure and every other performance number in this README remain **architecture targets** until the on-screen meter lands (Chunk 14).
 
 ## The problem
 
@@ -129,7 +129,7 @@ clicky/
 └── Tests/                    # one test target per logic module
 ```
 
-The full module graph and file-level layout are specified in [spec §5](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md). `Package.swift`, `Sources/`, `Tests/` (the Chunk 1 foundation), `Resources/`, `scripts/`, the menu-bar shell (Chunk 2), and the voice, accessibility, safety, input-synthesis and audio modules (Chunks 3–10) exist today; the Ghost Cursor overlay, tool router, end-to-end session wiring, latency meter and demo hardening land in later chunks.
+The full module graph and file-level layout are specified in [spec §5](docs/superpowers/specs/2026-10-05-clicky-voice-ai-cursor-design.md). `Package.swift`, `Sources/`, `Tests/` (the Chunk 1 foundation), `Resources/`, `scripts/`, the menu-bar shell (Chunk 2), and the voice, accessibility, safety, input-synthesis, audio and overlay modules (Chunks 3–11) exist today; the tool router, end-to-end session wiring, latency meter and demo hardening land in later chunks.
 
 ## Roadmap
 
@@ -147,7 +147,7 @@ Implementation runs in fifteen reviewed chunks (each ends with an acceptance tas
 | 8 | **Safety gates** | 5-tier risk gate, confirmation gate | ✅ Done |
 | 9 | **Audio capture & local stop** | Capture, AEC, local stop path | ✅ Done |
 | 10 | **Audio engine** | Session audio engine + barge-in | ✅ Done |
-| 11 | **Ghost Cursor overlay** | Per-screen panels + Ghost Cursor | ⬜ Planned |
+| 11 | **Ghost Cursor overlay** | Per-screen panels + Ghost Cursor | ✅ Done |
 | 12 | **Tool router & system instruction** | Tool routing + system prompt | ⬜ Planned |
 | 13 | **End-to-end wiring** | Session wiring across modules | ⬜ Planned |
 | 14 | **Latency meter & cost model** | T0–T12 meter + cost model | ⬜ Planned |
@@ -173,7 +173,7 @@ swift build                     # build the 9 module targets
 swift test                      # run all tests
 ```
 
-`swift test` of Chunk 10 (2026-10-06): **152 tests executed — 144 passed, 8 skipped (gated integration/live tests), 0 failures**; release build clean from a clean scratch build. Earlier milestones: `swift test` of Chunk 5 measured 57 tests, 0 failures, 3 live-spike tests skipped without a key (2026-10-05).
+`swift test` of Chunk 11 (2026-10-06): **171 tests executed — 160 passed, 11 skipped (gated integration/live tests), 0 failures**; `swift test --filter ClickyOverlayTests` = **19 executed with 3 tests skipped**; release build clean from a clean scratch build. Earlier milestones: Chunk 10 measured **152 tests executed — 144 passed, 8 skipped, 0 failures**; Chunk 5 measured 57 tests, 0 failures, 3 live-spike tests skipped without a key (2026-10-05).
 
 The signed `.app` path is `./scripts/make-app.sh` → `open build/Clicky.app` (`./scripts/run.sh` wraps both). The demo runs as a signed `.app` bundle (macOS kills microphone access for bare `swift run` executables without usage descriptions). `./scripts/doctor.sh` is the demo pre-flight. `GEMINI_API_KEY` is read from the environment — never committed.
 
