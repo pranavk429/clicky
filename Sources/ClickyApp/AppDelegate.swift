@@ -2,6 +2,7 @@ import AppKit
 import ClickyCore
 import ClickyAudio
 import ClickyInput
+import ClickyOverlay
 import os
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -38,8 +39,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         installHotKeys()
+        OverlayWindowController.shared.start()
+        SessionCoordinator.shared.onNotice = { [weak self] text in
+            Task { @MainActor in self?.setNotice(text) }
+        }
+        SessionCoordinator.shared.observeAppState()
     }
     @objc private func toggleSession() { state.toggleSession() }
+    func applicationWillTerminate(_ notification: Notification) {
+        Task { await SessionCoordinator.shared.stop(reason: .userToggle) }
+    }
     @objc private func showPermissions() { PermissionsWindowController.shared.show() }
     @objc private func runScriptedDemo() {
         let runner = demoRunner ?? ScriptedDemoRunner()
