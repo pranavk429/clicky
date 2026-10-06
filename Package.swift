@@ -7,7 +7,7 @@ let package = Package(
     products: [.executable(name: "ClickyApp", targets: ["ClickyApp"])],
     targets: [
         .target(name: "ClickyCore", swiftSettings: v5),
-        .target(name: "ClickyGemini", dependencies: ["ClickyCore", "ClickyAudio"], swiftSettings: v5),
+        .target(name: "ClickyGemini", dependencies: ["ClickyCore", "ClickyAudio", "ClickySafety"], swiftSettings: v5),
         .target(name: "ClickyAccessibility", dependencies: ["ClickyCore"], swiftSettings: v5),
         .target(name: "ClickyInput", dependencies: ["ClickyCore"], swiftSettings: v5),
         .target(name: "ClickySafety", dependencies: ["ClickyCore"], swiftSettings: v5),
@@ -20,7 +20,7 @@ let package = Package(
                            "ClickySafety", "ClickyAudio", "ClickyVision", "ClickyOverlay"],
             swiftSettings: v5),
         .testTarget(name: "ClickyCoreTests", dependencies: ["ClickyCore"], swiftSettings: v5),
-        .testTarget(name: "ClickyGeminiTests", dependencies: ["ClickyGemini"], swiftSettings: v5),
+        .testTarget(name: "ClickyGeminiTests", dependencies: ["ClickyGemini", "ClickySafety"], swiftSettings: v5),
         .testTarget(name: "ClickyAccessibilityTests", dependencies: ["ClickyAccessibility"], swiftSettings: v5),
         .testTarget(name: "ClickyInputTests", dependencies: ["ClickyInput"], swiftSettings: v5),
         .testTarget(name: "ClickySafetyTests", dependencies: ["ClickySafety"], swiftSettings: v5),
