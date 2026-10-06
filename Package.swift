@@ -25,5 +25,6 @@ let package = Package(
         .testTarget(name: "ClickyInputTests", dependencies: ["ClickyInput"], swiftSettings: v5),
         .testTarget(name: "ClickySafetyTests", dependencies: ["ClickySafety"], swiftSettings: v5),
         .testTarget(name: "ClickyAudioTests", dependencies: ["ClickyAudio"], swiftSettings: v5),
+        .testTarget(name: "ClickyOverlayTests", dependencies: ["ClickyOverlay", "ClickyCore"], swiftSettings: v5),
     ]
 )
