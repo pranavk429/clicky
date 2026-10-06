@@ -197,7 +197,8 @@ public final class OverlayWindowController {
         let presentations = OverlayPlacementResolver.resolve(command,
                                                              screens: panels.map(\.geometry),
                                                              lastActiveScreenID: lastActiveScreenID)
-        model.presentations = Dictionary(uniqueKeysWithValues: presentations.map { ($0.screenID, $0) })
+        model.presentations = Dictionary(presentations.map { ($0.screenID, $0) },
+                                         uniquingKeysWith: { _, latest in latest })
         guard let first = presentations.first else { return }
         switch first.state {
         case .confirm:

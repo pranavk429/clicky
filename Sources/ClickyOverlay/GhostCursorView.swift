@@ -116,6 +116,7 @@ struct GhostCursorView: View {
     @State private var travelFrom: CGPoint = .zero
     @State private var travelTo: CGPoint = .zero
     @State private var travelProgress: CGFloat = 1
+    @State private var travelSeeded = false
 
     private var presentation: PanelPresentation? { model.presentations[screenID] }
 
@@ -146,6 +147,17 @@ struct GhostCursorView: View {
                 travelProgress = 0
                 withAnimation(.linear(duration: 0.45)) { travelProgress = 1 }
             }
+        }
+        // `.onChange` never fires for a view's initial value, so a moving
+        // presentation already present on first appearance (the `present`
+        // fallback path, a screen-parameter rebuild) would leave the endpoints
+        // at `.zero` and anchor the pointer in the panel corner. Seed once from
+        // the current point; later moves stay on the unchanged `.onChange` path.
+        .onAppear {
+            guard !travelSeeded, let point = movingPoint else { return }
+            travelFrom = point
+            travelTo = point
+            travelSeeded = true
         }
     }
 
